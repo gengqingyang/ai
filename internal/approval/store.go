@@ -3,6 +3,7 @@ package approval
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"sync"
 	"time"
@@ -192,18 +193,18 @@ func (s *Store) writeAudit(event string, p *Proposal) {
 
 	line, err := json.Marshal(auditEntry{Timestamp: s.now(), Event: event, Proposal: p})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "审计日志序列化失败: %v\n", err)
+		slog.Error("审计日志序列化失败", "err", err)
 		return
 	}
 
 	f, err := os.OpenFile(s.auditPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		// 审计写失败不中断主流程，但必须让人看见。
-		fmt.Fprintf(os.Stderr, "审计日志打开失败 (%s): %v\n", s.auditPath, err)
+		slog.Error("审计日志打开失败", "path", s.auditPath, "err", err)
 		return
 	}
 	defer f.Close()
 	if _, err := f.Write(append(line, '\n')); err != nil {
-		fmt.Fprintf(os.Stderr, "审计日志写入失败: %v\n", err)
+		slog.Error("审计日志写入失败", "path", s.auditPath, "err", err)
 	}
 }

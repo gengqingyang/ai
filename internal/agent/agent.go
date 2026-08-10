@@ -10,23 +10,25 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sync"
+	"log/slog"
 
-	"github.com/cloudwego/eino/callbacks"
-	"github.com/cloudwego/eino/components"
+	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/compose"
-	einoagent "github.com/cloudwego/eino/flow/agent"
-	"github.com/cloudwego/eino/flow/agent/react"
 	"github.com/cloudwego/eino/schema"
 
 	"diagnostic-system/internal/config"
+	"diagnostic-system/internal/intent"
+	"diagnostic-system/internal/skills"
 	"diagnostic-system/internal/tools"
 )
 
-// Agent 包装 react.Agent，屏蔽掉 eino 的构造细节。
+// Agent 包装 ADK ChatModelAgent，屏蔽掉 Eino 的构造和事件细节。
 type Agent struct {
-	inner *react.Agent
+	inner      *adk.ChatModelAgent
+	baseModel  model.ToolCallingChatModel
+	classifier *intent.Classifier
+	skillNames []string
 }
 
 // New 构造 ReAct agent。
@@ -35,152 +37,263 @@ type Agent struct {
 // 提案」的门面（Registry 强制这一点），所以模型看得见、也能提议变更动作，
 // 但它手上那个工具没有执行能力——执行只发生在人工批准之后。
 func New(ctx context.Context, cm model.ToolCallingChatModel, reg *tools.Registry, cfg *config.Config) (*Agent, error) {
-	inner, err := react.NewAgent(ctx, &react.AgentConfig{
-		ToolCallingModel: cm,
-		ToolsConfig: compose.ToolsNodeConfig{
-			Tools: reg.All(),
+	classifier, err := intent.New(cm)
+	if err != nil {
+		return nil, fmt.Errorf("创建意图分类器失败: %w", err)
+	}
+
+	skillHandler, skillMatters, err := skills.Load(ctx, cfg.SkillsDir)
+	if err != nil {
+		return nil, err
+	}
+
+	inner, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+		Name:        "diagnostic-assistant",
+		Description: "CDN 业务智能诊断助手",
+		Instruction: SystemPrompt,
+		Model:       cm,
+		ToolsConfig: adk.ToolsConfig{
+			ToolsNodeConfig: compose.ToolsNodeConfig{Tools: reg.All()},
 		},
-		MaxStep: cfg.MaxStep,
-		// 部分兼容端点会先吐文本、后吐 tool call，eino 的默认检查器只看
-		// 第一个 chunk，会把「有工具调用」误判成「没有」。这里读完整段流。
-		StreamToolCallChecker: streamToolCallChecker,
+		MaxIterations: cfg.MaxStep,
+		Handlers:      []adk.ChatModelAgentMiddleware{skillHandler},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("创建 react agent 失败: %w", err)
+		return nil, fmt.Errorf("创建 ADK ChatModelAgent 失败: %w", err)
 	}
-	return &Agent{inner: inner}, nil
+
+	skillNames := make([]string, 0, len(skillMatters))
+	for _, matter := range skillMatters {
+		skillNames = append(skillNames, matter.Name)
+	}
+	return &Agent{
+		inner:      inner,
+		baseModel:  cm,
+		classifier: classifier,
+		skillNames: skillNames,
+	}, nil
+}
+
+// SkillNames 返回启动时已校验并挂载的 Skill 名称。
+func (a *Agent) SkillNames() []string {
+	return append([]string(nil), a.skillNames...)
 }
 
 // Generate 非流式地跑一轮，返回最终回复。
 func (a *Agent) Generate(ctx context.Context, msgs []*schema.Message) (*schema.Message, error) {
-	return a.inner.Generate(ctx, withSystemPrompt(msgs))
+	classification, err := a.classify(ctx, msgs)
+	if err != nil {
+		return nil, err
+	}
+	input := WithSystemPrompt(msgs, classification)
+	if classification.NeedsClarification {
+		// 信息不足时绕开 ReAct，并在模型调用层禁用工具，硬性阻止节点命令。
+		return a.baseModel.Generate(ctx, input, model.WithToolChoice(schema.ToolChoiceForbidden))
+	}
+	return a.run(ctx, withRoutingContext(msgs, classification), false, nil)
 }
 
-// Stream 流式地跑一轮。每收到一个文本片段就回调 onChunk，返回最终回复文本。
-//
-// 文字是从 ChatModel 的组件回调里抓的，不是从返回的那条流里抓的：ReAct 一轮
-// 里模型会说好几次话（「我先看看节点时间」→ 调工具 → 「时间正常」），但只有
-// 最后一次会流到调用方手上，中间那几次全被 agent 内部消费掉了。只读返回流的
-// 话，屏幕上就是敲完问题一片空白，直到审核框突然弹出来。接到组件回调上，每
-// 一段都能边生成边打。
-//
-// 返回值仍取自最终输出流——那是这一轮真正的回复，写进历史的必须是它。
-func (a *Agent) Stream(ctx context.Context, msgs []*schema.Message, onChunk func(string)) (string, error) {
-	var opts []einoagent.AgentOption
-	if onChunk != nil {
-		opts = append(opts, einoagent.WithComposeOptions(
-			compose.WithCallbacks(newStreamPrinter(onChunk)),
-		))
+// Stream 流式地跑一轮。ADK 会为每次模型输出产生事件；每收到一个文本片段就
+// 回调 onChunk，但返回值只取最后一条不含 tool call 的 assistant 消息，供历史保存。
+func (a *Agent) Stream(
+	ctx context.Context,
+	msgs []*schema.Message,
+	onIntent func(intent.Result),
+	onChunk func(string),
+) (string, error) {
+	classification, err := a.classify(ctx, msgs)
+	if err != nil {
+		return "", err
+	}
+	if onIntent != nil {
+		onIntent(classification)
 	}
 
-	sr, err := a.inner.Stream(ctx, withSystemPrompt(msgs), opts...)
+	if classification.NeedsClarification {
+		return StreamClarification(ctx, a.baseModel, WithSystemPrompt(msgs, classification), onChunk)
+	}
+
+	reply, err := a.run(ctx, withRoutingContext(msgs, classification), true, onChunk)
+	if err != nil {
+		return "", err
+	}
+	if reply == nil {
+		return "", nil
+	}
+	return reply.Content, nil
+}
+
+// run consumes ADK events and returns the last assistant message without tool
+// calls. ADK emits every model turn, so intermediate explanations can be
+// streamed before an approval prompt while only the final answer enters history.
+func (a *Agent) run(
+	ctx context.Context,
+	msgs []*schema.Message,
+	stream bool,
+	onChunk func(string),
+) (*schema.Message, error) {
+	runner := adk.NewRunner(ctx, adk.RunnerConfig{
+		Agent:           a.inner,
+		EnableStreaming: stream,
+	})
+	iter := runner.Run(ctx, msgs)
+
+	var final *schema.Message
+	segments := 0
+	for {
+		event, ok := iter.Next()
+		if !ok {
+			return final, nil
+		}
+		if event == nil {
+			continue
+		}
+		if event.Err != nil {
+			return final, event.Err
+		}
+		if event.Output == nil || event.Output.MessageOutput == nil {
+			continue
+		}
+		output := event.Output.MessageOutput
+		if output.Role != schema.Assistant {
+			continue
+		}
+
+		msg, err := consumeMessageOutput(output, onChunk, &segments)
+		if err != nil {
+			return final, err
+		}
+		if msg != nil && len(msg.ToolCalls) == 0 {
+			final = msg
+		}
+	}
+}
+
+func consumeMessageOutput(output *adk.MessageVariant, onChunk func(string), segments *int) (*schema.Message, error) {
+	if !output.IsStreaming {
+		msg := output.Message
+		if msg != nil && msg.Content != "" && onChunk != nil {
+			startSegment(onChunk, segments)
+			onChunk(msg.Content)
+		}
+		return msg, nil
+	}
+	if output.MessageStream == nil {
+		return nil, errors.New("ADK 返回了空的消息流")
+	}
+	defer output.MessageStream.Close()
+
+	chunks := make([]*schema.Message, 0, 8)
+	started := false
+	for {
+		chunk, err := output.MessageStream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		chunks = append(chunks, chunk)
+		if chunk != nil && chunk.Content != "" && onChunk != nil {
+			if !started {
+				startSegment(onChunk, segments)
+				started = true
+			}
+			onChunk(chunk.Content)
+		}
+	}
+	if len(chunks) == 0 {
+		return nil, nil
+	}
+	msg, err := schema.ConcatMessages(chunks)
+	if err != nil {
+		return nil, fmt.Errorf("合并 ADK 回复失败: %w", err)
+	}
+	return msg, nil
+}
+
+func startSegment(onChunk func(string), segments *int) {
+	if *segments > 0 {
+		onChunk("\n")
+	}
+	(*segments)++
+}
+
+func (a *Agent) classify(ctx context.Context, msgs []*schema.Message) (intent.Result, error) {
+	result, err := a.classifier.Classify(ctx, msgs)
+	if err != nil {
+		return intent.Result{}, fmt.Errorf("意图识别失败: %w", err)
+	}
+	slog.Info("意图识别",
+		"intent", result.Intent,
+		"confidence", result.Confidence,
+		"summary", result.Summary,
+		"evidence", result.Evidence,
+		"needs_clarification", result.NeedsClarification,
+		"device_ids", result.DeviceIDs,
+		"missing_information", result.MissingInformation,
+	)
+	return result, nil
+}
+
+// StreamClarification streams a reply while forbidding all tool calls.
+func StreamClarification(
+	ctx context.Context,
+	baseModel model.ToolCallingChatModel,
+	msgs []*schema.Message,
+	onChunk func(string),
+) (string, error) {
+	sr, err := baseModel.Stream(
+		ctx,
+		msgs,
+		model.WithToolChoice(schema.ToolChoiceForbidden),
+	)
 	if err != nil {
 		return "", err
 	}
 	defer sr.Close()
 
-	// 这里只负责把最终回复拼出来，不再打印——正文已经由上面的回调实时打过了，
-	// 再打一遍就是重影。
-	var full []byte
+	chunks := make([]*schema.Message, 0, 8)
 	for {
 		chunk, err := sr.Recv()
 		if errors.Is(err, io.EOF) {
-			return string(full), nil
-		}
-		if err != nil {
-			return string(full), err
-		}
-		full = append(full, chunk.Content...)
-	}
-}
-
-// streamPrinter 把模型每一段输出实时喂给 onChunk。
-type streamPrinter struct {
-	onChunk func(string)
-
-	mu       sync.Mutex
-	segments int // 已经打印过正文的模型输出段数
-}
-
-func newStreamPrinter(onChunk func(string)) callbacks.Handler {
-	p := &streamPrinter{onChunk: onChunk}
-	return callbacks.NewHandlerBuilder().
-		OnEndWithStreamOutputFn(p.onModelOutput).
-		Build()
-}
-
-// onModelOutput 同步读完模型这一段输出，边读边打。
-//
-// 同步而不是丢个 goroutine 去读：读完才返回，后面的审核框、执行回执就一定排在
-// 这段文字之后打印，不会插进句子中间。拿到的流是 eino 给回调单独复制的一份，
-// 用链表缓冲，读它既抢不走下游的数据、也卡不住下游；chunk 由模型组件在另一
-// 个 goroutine 里产出，所以在这里读到底也不会自锁。
-//
-// eino 要求回调必须关掉这份副本，否则漏 goroutine。
-func (p *streamPrinter) onModelOutput(ctx context.Context, info *callbacks.RunInfo,
-	out *schema.StreamReader[callbacks.CallbackOutput]) context.Context {
-
-	if info == nil || info.Component != components.ComponentOfChatModel {
-		out.Close()
-		return ctx
-	}
-	defer out.Close()
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	first := true
-	for {
-		chunk, err := out.Recv()
-		if err != nil {
-			// io.EOF 是正常收尾；其它错误主流程那条流也会报，这里是旁路，
-			// 安静退出就行，别把半截错误打到用户脸上。
-			return ctx
-		}
-		o := model.ConvCallbackOutput(chunk)
-		if o == nil || o.Message == nil || o.Message.Content == "" {
-			continue // tool call 的分片没有正文
-		}
-		if first {
-			first = false
-			p.segments++
-			if p.segments > 1 {
-				// 上一段之后夹着审核框、执行回执，空一行再接着说。
-				p.onChunk("\n")
+			if len(chunks) == 0 {
+				return "", nil
 			}
+			merged, mergeErr := schema.ConcatMessages(chunks)
+			if mergeErr != nil {
+				return "", fmt.Errorf("合并澄清回复失败: %w", mergeErr)
+			}
+			return merged.Content, nil
 		}
-		p.onChunk(o.Message.Content)
+		if err != nil {
+			return "", err
+		}
+		chunks = append(chunks, chunk)
+		if onChunk != nil && chunk != nil && chunk.Content != "" {
+			onChunk(chunk.Content)
+		}
 	}
 }
 
-// withSystemPrompt 在消息列表前插入 system 消息。
+// WithSystemPrompt 在消息列表前插入全局约束和本轮意图路由元数据。
 //
 // 调用方（session）只维护 user/assistant 历史，system prompt 由这里统一注入，
 // 保证它永远在最前面、且不会被历史裁剪掉。
-func withSystemPrompt(msgs []*schema.Message) []*schema.Message {
+func WithSystemPrompt(msgs []*schema.Message, classification intent.Result) []*schema.Message {
+	out := make([]*schema.Message, 0, len(msgs)+2)
 	if len(msgs) > 0 && msgs[0].Role == schema.System {
-		return msgs
+		out = append(out, msgs[0])
+		msgs = msgs[1:]
+	} else {
+		out = append(out, schema.SystemMessage(SystemPrompt))
 	}
-	out := make([]*schema.Message, 0, len(msgs)+1)
-	out = append(out, schema.SystemMessage(SystemPrompt))
+	out = append(out, schema.SystemMessage(classification.RoutingContext()))
 	return append(out, msgs...)
 }
 
-// streamToolCallChecker 一直读到出现 tool call 或流结束为止。
-//
-// eino 要求这个函数在返回前关掉 modelOutput 流。
-func streamToolCallChecker(_ context.Context, modelOutput *schema.StreamReader[*schema.Message]) (bool, error) {
-	defer modelOutput.Close()
-	for {
-		msg, err := modelOutput.Recv()
-		if errors.Is(err, io.EOF) {
-			return false, nil
-		}
-		if err != nil {
-			return false, err
-		}
-		if len(msg.ToolCalls) > 0 {
-			return true, nil
-		}
-	}
+func withRoutingContext(msgs []*schema.Message, classification intent.Result) []*schema.Message {
+	out := make([]*schema.Message, 0, len(msgs)+1)
+	out = append(out, schema.SystemMessage(classification.RoutingContext()))
+	return append(out, msgs...)
 }

@@ -38,7 +38,7 @@ func newOpenAIChatModel(ctx context.Context, cfg *config.Config) (model.ToolCall
 	maxTokens := cfg.MaxTokens
 	c := &openai.ChatModelConfig{
 		APIKey:              apiKey,
-		BaseURL:             openAIBaseURL(cfg.BaseURL),
+		BaseURL:             OpenAIBaseURL(cfg.BaseURL),
 		Model:               cfg.Model,
 		MaxCompletionTokens: &maxTokens,
 		HTTPClient:          newOpenAIHTTPClient(),
@@ -55,9 +55,9 @@ func newOpenAIChatModel(ctx context.Context, cfg *config.Config) (model.ToolCall
 	return cm, nil
 }
 
-// openAIBaseURL 把网关根地址规范化为 OpenAI 客户端需要的 API 根地址。
+// OpenAIBaseURL 把网关根地址规范化为 OpenAI 客户端需要的 API 根地址。
 // 客户端会自行追加 /chat/completions，因此 https://host 应变成 https://host/v1。
-func openAIBaseURL(baseURL string) string {
+func OpenAIBaseURL(baseURL string) string {
 	baseURL = strings.TrimRight(baseURL, "/")
 	if baseURL == "" || strings.HasSuffix(baseURL, "/v1") {
 		return baseURL

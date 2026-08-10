@@ -1,4 +1,4 @@
-package llm
+package test
 
 import (
 	"context"
@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	. "diagnostic-system/internal/llm"
 
 	"github.com/cloudwego/eino/schema"
 
@@ -88,28 +90,27 @@ func TestOpenAIChatModelRequest(t *testing.T) {
 
 func TestRetryTransportDoesNotRetryBadRequest(t *testing.T) {
 	attempts := 0
-	transport := &retryTransport{
-		base: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			attempts++
-			return &http.Response{
-				StatusCode: http.StatusBadRequest,
-				Body:       io.NopCloser(strings.NewReader("bad request")),
-				Request:    r,
-			}, nil
-		}),
-		maxRetries: 2,
-	}
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
-		"https://api.qiso.io/v1/chat/completions", strings.NewReader("{}"))
-	if err != nil {
-		t.Fatalf("NewRequestWithContext() error = %v", err)
-	}
+	oldTransport := http.DefaultTransport
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		attempts++
+		return &http.Response{
+			StatusCode: http.StatusBadRequest,
+			Status:     "400 Bad Request",
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("bad request")),
+			Request:    r,
+		}, nil
+	})
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
 
-	resp, err := transport.RoundTrip(req)
+	cm, err := NewChatModel(context.Background(), &config.Config{
+		Provider: "openai", BaseURL: "https://api.qiso.io", AuthToken: "test-token",
+		Model: "gpt-5.6-sol", MaxTokens: 64, Temperature: -1,
+	})
 	if err != nil {
-		t.Fatalf("RoundTrip() error = %v", err)
+		t.Fatalf("NewChatModel() error = %v", err)
 	}
-	defer resp.Body.Close()
+	_, _ = cm.Generate(context.Background(), []*schema.Message{schema.UserMessage("hello")})
 	if attempts != 1 {
 		t.Errorf("request attempts = %d, want 1", attempts)
 	}
@@ -129,7 +130,7 @@ func TestOpenAIBaseURL(t *testing.T) {
 		"https://api.qiso.io/":      "https://api.qiso.io/v1",
 	}
 	for input, want := range tests {
-		if got := openAIBaseURL(input); got != want {
+		if got := OpenAIBaseURL(input); got != want {
 			t.Errorf("openAIBaseURL(%q) = %q, want %q", input, got, want)
 		}
 	}

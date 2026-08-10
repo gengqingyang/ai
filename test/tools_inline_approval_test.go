@@ -1,4 +1,4 @@
-package tools
+package test
 
 import (
 	"context"
@@ -6,6 +6,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	. "diagnostic-system/internal/tools"
 
 	"diagnostic-system/internal/approval"
 )
@@ -154,7 +156,7 @@ func TestApproverErrorDefaultsToNotExecuting(t *testing.T) {
 }
 
 // 没配 Approver 时保持异步模式：只留提案，等外部 Execute/Reject。
-// 钉钉那种「发卡片、等人点」的场景走这条路。
+// 外部管理程序异步处理提案时走这条路。
 func TestWithoutApproverStaysPending(t *testing.T) {
 	ctx := context.Background()
 	real := newFakeMutating("run_tunnel_cmd")

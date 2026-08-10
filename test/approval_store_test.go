@@ -1,4 +1,4 @@
-package approval
+package test
 
 import (
 	"bufio"
@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	. "diagnostic-system/internal/approval"
 )
 
 func fixedClock() func() time.Time {

@@ -28,7 +28,7 @@ type Decision struct {
 
 // Approver 向人索取一条操作提案的审核决定。
 //
-// 命令行实现是在终端里打印命令并等 y/n；接钉钉时换成互动卡片，
+// 命令行实现是在终端里打印命令并等 y/n；也可接入其他外部审核程序，
 // Gate 这一层不用改。返回 error 表示没能取到决定（比如输入流断了），
 // 这种情况按「不执行」处理——拿不到人的确认就绝不动手。
 type Approver interface {
@@ -58,7 +58,7 @@ var ErrToolTimeout = errors.New("调用超时")
 //	驳回 → 什么都不做，把驳回理由返回给模型
 //
 // 没有配置 Approver 时退化成异步模式：只登记提案就返回，等外部调用
-// Execute/Reject（钉钉审批、值班同事事后处理等场景）。
+// Execute/Reject（外部管理程序或值班同事事后处理等场景）。
 //
 // 无论哪种模式，模型手上那个工具都没有执行能力——真实实现只存在于
 // Gate.inner 里。这是结构上的隔离，不是靠 prompt 约束模型「不要执行」。
@@ -190,16 +190,16 @@ func (g *Gate) run(ctx context.Context, inner tool.InvokableTool, args string) (
 
 	select {
 	case o := <-done:
-		return o.result, describeRunError(o.err, g.timeout)
+		return o.result, DescribeRunError(o.err, g.timeout)
 	case <-ctx.Done():
-		return "", describeRunError(ctx.Err(), g.timeout)
+		return "", DescribeRunError(ctx.Err(), g.timeout)
 	}
 }
 
-// describeRunError 把执行错误翻成人和模型都能直接读的一句话。
+// DescribeRunError 把执行错误翻成人和模型都能直接读的一句话。
 //
 // 「context deadline exceeded」对着审核人弹出来等于没说。
-func describeRunError(err error, timeout time.Duration) error {
+func DescribeRunError(err error, timeout time.Duration) error {
 	switch {
 	case err == nil:
 		return nil
@@ -208,16 +208,16 @@ func describeRunError(err error, timeout time.Duration) error {
 	case errors.Is(err, context.Canceled):
 		return fmt.Errorf("调用被取消（Ctrl-C 或会话结束）: %w", err)
 	default:
-		return unwrapToolError(err)
+		return UnwrapToolError(err)
 	}
 }
 
-// unwrapToolError 剥掉 eino 给工具错误套的外壳。
+// UnwrapToolError 剥掉 eino 给工具错误套的外壳。
 //
 // 原文长这样：「[LocalFunc] failed to invoke tool, toolName=run_tunnel_cmd,
 // err=下发到节点 SN001 失败: ...」。前半截对审核人没有任何信息量，工具名提案里
 // 本来就写着——留下真正的原因就行。
-func unwrapToolError(err error) error {
+func UnwrapToolError(err error) error {
 	msg := err.Error()
 	if !strings.HasPrefix(msg, "[LocalFunc]") {
 		return err

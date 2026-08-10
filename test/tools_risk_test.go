@@ -1,6 +1,10 @@
-package tools
+package test
 
-import "testing"
+import (
+	"testing"
+
+	. "diagnostic-system/internal/tools"
+)
 
 func TestAssessCommand(t *testing.T) {
 	tests := []struct {

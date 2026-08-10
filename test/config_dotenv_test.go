@@ -1,9 +1,11 @@
-package config
+package test
 
 import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	. "diagnostic-system/internal/config"
 )
 
 func TestParseEnvLine(t *testing.T) {
@@ -30,7 +32,7 @@ func TestParseEnvLine(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			key, value, ok := parseEnvLine(c.line)
+			key, value, ok := ParseEnvLine(c.line)
 			if ok != c.wantOK {
 				t.Fatalf("ok = %v, 期望 %v", ok, c.wantOK)
 			}
@@ -70,7 +72,7 @@ func TestLoadDotEnv(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := loadDotEnv(); err != nil {
+	if err := LoadDotEnv(); err != nil {
 		t.Fatalf("loadDotEnv 失败: %v", err)
 	}
 
@@ -84,7 +86,7 @@ func TestLoadDotEnv(t *testing.T) {
 
 func TestLoadDotEnvMissingFileIsOK(t *testing.T) {
 	t.Setenv("ENV_FILE", filepath.Join(t.TempDir(), "does-not-exist"))
-	if err := loadDotEnv(); err != nil {
+	if err := LoadDotEnv(); err != nil {
 		t.Errorf("文件不存在时应当无错误，实际: %v", err)
 	}
 }

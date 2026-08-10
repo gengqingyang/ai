@@ -1,4 +1,4 @@
-package tools
+package test
 
 import (
 	"context"
@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	. "diagnostic-system/internal/tools"
 
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
@@ -164,11 +166,11 @@ func TestNoticerReceivesOutcome(t *testing.T) {
 func TestDescribeRunError(t *testing.T) {
 	timeout := 30 * time.Second
 
-	if got := describeRunError(nil, timeout); got != nil {
+	if got := DescribeRunError(nil, timeout); got != nil {
 		t.Errorf("describeRunError(nil) = %v, want nil", got)
 	}
 
-	got := describeRunError(context.DeadlineExceeded, timeout)
+	got := DescribeRunError(context.DeadlineExceeded, timeout)
 	if !errors.Is(got, ErrToolTimeout) {
 		t.Errorf("超时没有归到 ErrToolTimeout: %v", got)
 	}
@@ -177,7 +179,7 @@ func TestDescribeRunError(t *testing.T) {
 	}
 
 	own := errors.New("节点离线")
-	if got := describeRunError(own, timeout); !errors.Is(got, own) {
+	if got := DescribeRunError(own, timeout); !errors.Is(got, own) {
 		t.Errorf("普通错误被改写了: %v", got)
 	}
 }
@@ -186,13 +188,13 @@ func TestDescribeRunError(t *testing.T) {
 // 那截前缀对审核人没有信息量，弹到终端上只会盖住真正的原因。
 func TestUnwrapToolError(t *testing.T) {
 	wrapped := errors.New("[LocalFunc] failed to invoke tool, toolName=run_tunnel_cmd, err=下发到节点 SN001 失败: http status code [400]")
-	got := unwrapToolError(wrapped).Error()
+	got := UnwrapToolError(wrapped).Error()
 	if got != "下发到节点 SN001 失败: http status code [400]" {
 		t.Errorf("剥壳结果 = %q", got)
 	}
 
 	plain := errors.New("节点离线")
-	if unwrapToolError(plain) != plain {
+	if UnwrapToolError(plain) != plain {
 		t.Error("不带外壳的错误不该被动")
 	}
 }

@@ -27,7 +27,13 @@ import (
 // 日志写文件而不是 stderr：终端里正在跑对话，日志刷屏会把对话冲掉。
 // 配置 LOG_FILE=stderr 可以强制打到终端，调试时用。
 func Setup(cfg *config.Config) (func() error, error) {
-	w, closeFn, err := openSink(cfg.LogFile)
+	return SetupWithConsole(cfg, os.Stderr)
+}
+
+// SetupWithConsole 允许 TUI 把显式配置的终端日志接入自己的消息通道。
+// console 为 nil 时丢弃终端日志，文件日志行为不变。
+func SetupWithConsole(cfg *config.Config, console io.Writer) (func() error, error) {
+	w, closeFn, err := openSink(cfg.LogFile, console)
 	if err != nil {
 		return nil, err
 	}
@@ -89,14 +95,17 @@ func InstallEinoCallbacks() {
 type startTimeKey struct{}
 
 // openSink 打开日志输出目标。空路径表示丢弃。
-func openSink(path string) (io.Writer, func() error, error) {
+func openSink(path string, console io.Writer) (io.Writer, func() error, error) {
 	noop := func() error { return nil }
 
 	switch {
 	case path == "":
 		return io.Discard, noop, nil
 	case isStderr(path):
-		return os.Stderr, noop, nil
+		if console == nil {
+			console = io.Discard
+		}
+		return console, noop, nil
 	}
 
 	if dir := filepath.Dir(path); dir != "." && dir != "" {
