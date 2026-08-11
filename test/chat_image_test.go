@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	. "diagnostic-system/internal/chat"
+	"diagnostic-system/internal/ui"
 
 	"github.com/cloudwego/eino/schema"
 )
@@ -89,7 +90,7 @@ func TestBuildImageRejectsUnsupportedAndOversizedFiles(t *testing.T) {
 }
 
 func TestInputMaxBytesSupportsMillionTokenInput(t *testing.T) {
-	if got, want := InputMaxBytes(1_000_000), 5_000_000; got != want {
+	if got, want := ui.InputMaxBytes(1_000_000), 5_000_000; got != want {
 		t.Fatalf("InputMaxBytes(1M) = %d, want %d", got, want)
 	}
 }

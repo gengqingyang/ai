@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"regexp"
 	"sync"
 
 	"github.com/cloudwego/eino/components/tool"
@@ -18,6 +19,8 @@ const defaultTunnelAPI = "https://tw15a0050.onething.net:17813/p/10.128.4.223/55
 
 // tunnelToolName 是工具名。风险评估要按工具名解析参数，所以抽成常量。
 const tunnelToolName = "run_tunnel_cmd"
+
+var tunnelSecretPattern = regexp.MustCompile(`(?i)(access_token|auth_token|api_key|token)=([^&\s"']+)`)
 
 type tunnel struct {
 	operator string
@@ -52,7 +55,8 @@ func (x *tunnel) SetOperator(operator string) *tunnel {
 // RunCmd 通过 Tunnel 通道在指定节点上执行 shell 命令。
 // 办公网和统计中心机器都能使用。
 //
-// 这是真实的远程执行，不是 mock。调用方必须确保已经过人工审核。
+// 这是真实的远程执行，不是 mock。任意命令必须经过人工审核；唯一例外是
+// evidence.go 内部不向包外暴露的固定只读模板。
 func (x *tunnel) RunCmd(ctx context.Context, sn, cmd string) *TunnelResult {
 	x.initOnce.Do(func() {
 		api := os.Getenv("TUNNEL_API")
@@ -70,7 +74,7 @@ func (x *tunnel) RunCmd(ctx context.Context, sn, cmd string) *TunnelResult {
 
 	out := &TunnelResult{Sn: sn, Result: result}
 	if err != nil {
-		out.Error = err.Error()
+		out.Error = tunnelSecretPattern.ReplaceAllString(err.Error(), "$1=[REDACTED]")
 	}
 	return out
 }

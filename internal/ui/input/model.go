@@ -1,7 +1,9 @@
-package chat
+// Package input 提供可嵌入 Bubble Tea 根模型的 Unicode 单行输入框。
+package input
 
 import (
 	"context"
+	"strings"
 	"unicode"
 	"unicode/utf8"
 
@@ -9,11 +11,24 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-const inputPromptStyled = "\033[36m你 >\033[0m "
+const defaultPrompt = "› "
 
-// LineInputModel 是按 rune 编辑的单行终端输入框。终端规范模式会按字节删除
-// UTF-8 中文字符；Bubble Tea 的 KeyRunes 可以保证一次退格删除一个完整字符。
-type LineInputModel struct {
+var (
+	textStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FAFAFA")).
+			Background(lipgloss.Color("#303030"))
+	cursorStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#303030")).
+			Background(lipgloss.Color("#A1A1AA"))
+)
+
+type layout struct {
+	contentWidth int
+	padding      int
+}
+
+// Model 按 rune 编辑单行输入，避免 UTF-8 中文被按字节删除。
+type Model struct {
 	value    []rune
 	cursor   int
 	maxBytes int
@@ -23,13 +38,14 @@ type LineInputModel struct {
 	err      error
 }
 
-func NewLineInputModel(maxBytes int) LineInputModel {
-	return LineInputModel{maxBytes: maxBytes, prompt: inputPromptStyled}
+// New 创建输入框。
+func New(maxBytes int) Model {
+	return Model{maxBytes: maxBytes, prompt: defaultPrompt}
 }
 
-func (m LineInputModel) Init() tea.Cmd { return nil }
+func (m Model) Init() tea.Cmd { return nil }
 
-func (m LineInputModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.done {
 		return m, nil
 	}
@@ -92,48 +108,53 @@ func (m LineInputModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m LineInputModel) View() string {
+func (m Model) View() string {
 	if m.done {
 		if m.err != nil {
 			return ""
 		}
-		return m.prompt + string(m.value) + "\n"
+		return m.renderCompleted()
 	}
 
-	start, end := m.visibleRange()
-	before := string(m.value[start:m.cursor])
-	after := ""
+	layout := m.layout()
 	cursor := " "
 	if m.cursor < len(m.value) {
 		cursor = string(m.value[m.cursor])
+	}
+	cursorWidth := lipgloss.Width(cursor)
+	if cursorWidth < 1 || cursorWidth > layout.contentWidth {
+		cursor = " "
+		cursorWidth = 1
+	}
+	prompt := truncateCells(m.prompt, max(0, layout.contentWidth-cursorWidth))
+	available := layout.contentWidth - lipgloss.Width(prompt)
+	start, end := m.visibleRange(available, cursorWidth)
+	before := string(m.value[start:m.cursor])
+	after := ""
+	if m.cursor < len(m.value) {
 		after = string(m.value[m.cursor+1 : end])
 	}
-	return m.prompt + before + "\033[7m" + cursor + "\033[0m" + after
+
+	used := lipgloss.Width(prompt+before) + cursorWidth + lipgloss.Width(after)
+	left := strings.Repeat(" ", layout.padding) + prompt + before
+	right := after + strings.Repeat(" ", max(0, layout.contentWidth-used)+layout.padding)
+	line := textStyle.Render(left) + cursorStyle.Render(cursor) + textStyle.Render(right)
+	return renderBar(line, layout)
 }
 
-func (m LineInputModel) Value() string { return string(m.value) }
-func (m LineInputModel) Cursor() int   { return m.cursor }
-func (m LineInputModel) Done() bool    { return m.done }
-func (m LineInputModel) Err() error    { return m.err }
+func (m Model) Value() string { return string(m.value) }
+func (m Model) Cursor() int   { return m.cursor }
+func (m Model) Done() bool    { return m.done }
+func (m Model) Err() error    { return m.err }
 
 // WithPrompt 返回使用指定提示词的输入框副本。
-func (m LineInputModel) WithPrompt(prompt string) LineInputModel {
+func (m Model) WithPrompt(prompt string) Model {
 	m.prompt = prompt
 	return m
 }
 
-func (m LineInputModel) visibleRange() (int, int) {
-	if m.width <= 0 {
-		return 0, len(m.value)
-	}
-	available := m.width - lipgloss.Width(m.prompt)
-	if available < 1 {
-		available = 1
-	}
-	cursorWidth := 1
-	if m.cursor < len(m.value) {
-		cursorWidth = lipgloss.Width(string(m.value[m.cursor]))
-	}
+func (m Model) visibleRange(available, cursorWidth int) (int, int) {
+	available = max(available, cursorWidth)
 	start := 0
 	for start < m.cursor && lipgloss.Width(string(m.value[start:m.cursor]))+cursorWidth > available {
 		start++
@@ -154,14 +175,62 @@ func (m LineInputModel) visibleRange() (int, int) {
 	return start, end
 }
 
-func (m *LineInputModel) insert(runes []rune) {
+func (m Model) renderCompleted() string {
+	layout := m.layout()
+	prompt := truncateCells(m.prompt, layout.contentWidth)
+	available := layout.contentWidth - lipgloss.Width(prompt)
+	start := len(m.value)
+	for start > 0 && lipgloss.Width(string(m.value[start-1:])) <= available {
+		start--
+	}
+	value := string(m.value[start:])
+	used := lipgloss.Width(prompt + value)
+	line := strings.Repeat(" ", layout.padding) + prompt + value +
+		strings.Repeat(" ", max(0, layout.contentWidth-used)+layout.padding)
+	return renderBar(textStyle.Render(line), layout)
+}
+
+func (m Model) layout() layout {
+	if m.width <= 0 {
+		contentWidth := lipgloss.Width(m.prompt) + lipgloss.Width(string(m.value)) + 1
+		return layout{contentWidth: max(1, contentWidth), padding: 1}
+	}
+	if m.width >= 3 {
+		return layout{contentWidth: m.width - 2, padding: 1}
+	}
+	return layout{contentWidth: max(1, m.width)}
+}
+
+func renderBar(line string, layout layout) string {
+	width := layout.contentWidth + 2*layout.padding
+	spacer := textStyle.Render(strings.Repeat(" ", width))
+	return spacer + "\n" + line + "\n" + spacer
+}
+
+func truncateCells(text string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	var result strings.Builder
+	used := 0
+	for _, r := range text {
+		cellWidth := lipgloss.Width(string(r))
+		if used+cellWidth > width {
+			break
+		}
+		result.WriteRune(r)
+		used += cellWidth
+	}
+	return result.String()
+}
+
+func (m *Model) insert(runes []rune) {
 	accepted := make([]rune, 0, len(runes))
 	remaining := m.maxBytes
 	if m.maxBytes > 0 {
 		remaining -= len(string(m.value))
 	}
 	for _, r := range runes {
-		// 粘贴多行文本时保持单行语义，避免一段粘贴意外提交多轮请求。
 		if r == '\r' || r == '\n' {
 			r = ' '
 		}
@@ -185,7 +254,7 @@ func (m *LineInputModel) insert(runes []rune) {
 	m.cursor += len(accepted)
 }
 
-func (m *LineInputModel) deleteBeforeCursor() {
+func (m *Model) deleteBeforeCursor() {
 	if m.cursor == 0 {
 		return
 	}
@@ -193,7 +262,7 @@ func (m *LineInputModel) deleteBeforeCursor() {
 	m.cursor--
 }
 
-func (m *LineInputModel) deleteAtCursor() {
+func (m *Model) deleteAtCursor() {
 	if m.cursor >= len(m.value) {
 		return
 	}

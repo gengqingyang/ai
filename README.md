@@ -81,6 +81,22 @@ description: CDN 节点故障诊断的系统化采证流程。
 
 模型平时只看到 Skill 的名称和描述；用户请求匹配时，模型调用只读的 `skill` 工具按需加载完整正文，实现渐进式披露。启动阶段会解析全部 Skill，并拒绝空名称、空描述、重名、非法 frontmatter 和当前未配置隔离边界的 `fork` / `fork_with_context` 模式。当前只支持 inline Skill；Skill 工具只读取本地指令，不进入变更工具注册表，也不能绕过节点命令的人工审批 Gate。
 
+## 结构化只读采证
+
+Agent 注册了五个使用固定命令模板的节点采证工具：
+
+| 工具 | 证据范围 |
+| --- | --- |
+| `get_installation_evidence` | 系统就绪状态、失败服务、资源水位、装机相关进程 |
+| `get_traffic_evidence` | 默认网卡的收发速率、包速率、错误和丢包增量 |
+| `get_plugin_evidence` | 核心插件的 systemd 状态、退出码和可执行文件位置 |
+| `get_kernel_evidence` | 当前内核、默认启动内核和已安装内核 |
+| `get_network_evidence` | 接口、IPv4 地址、默认路由、DNS 和累计错误计数 |
+
+这些工具只接受节点 ID；流量工具额外接受 1～5 秒采样窗口。模型不能传入 Shell，节点 ID 也不会拼接进命令。Go 层将输出解析成统一的 `EvidenceReport`，包含 `data_source`、`collected_at`、状态、摘要、证据项和局限说明，再交给模型推理。任意 `run_tunnel_cmd` 仍属于变更类工具，即使具体命令看起来只读也必须经过人工审批。
+
+当前流量证据只代表节点默认网卡，不等于 CDN 业务请求量；装机证据是节点当前快照，不替代装机平台的历史阶段数据。工具会在结果中显式返回这些限制。
+
 ## 意图识别
 
 入口分类器使用独立的 report_intent 输出 schema，不执行任何工具。OpenAI 和 Claude 都通过强制 tool choice 返回同一份结构化结果，包含意图、置信度、摘要、证据、设备 ID、缺失信息和是否需要澄清。
@@ -164,7 +180,7 @@ ENV_FILE=/path/to/prod.env go run ./cmd/chat   # 指定别的配置文件
 - 批准时回放的是提案里存的**原始参数**，不做任何二次加工：审核人看到的和实际执行的必须是同一个东西。
 - 状态机 `pending → approved → executed/failed`（或 `pending → rejected`）带前置状态校验，一条提案不会被重复批准、也不会绕过批准直接执行。
 - 每次状态流转追加一行 JSON 到 `AUDIT_LOG`，含提案 ID、工具、完整参数、审核人、时间、执行结果。
-- **失败方向朝安全那边倒**：审核环节报错、Ctrl-C 中断或 Bubble Tea 界面关闭，全部当作「未批准」。`UIApprover` 不读取 stdin，而是把提案送进根 Model 后同步等待明确决定；没有收到 UI 回传就绝不执行。
+- **失败方向朝安全那边倒**：审核环节报错、Ctrl-C 中断或 Bubble Tea 界面关闭，全部当作「未批准」。`ui.Approver` 不读取 stdin，而是把提案送进根 Model 后同步等待明确决定；没有收到 UI 回传就绝不执行。
 
 不配 `Approver` 时闸门退回异步模式：只登记提案、返回 `pending_approval`，等外部管理程序调用 `Execute`/`Reject`。
 
@@ -215,12 +231,22 @@ OpenAI 兼容端点的空闲连接会在 30 秒后回收，避免长工具调用
 ```
 cmd/chat/main.go          命令行薄入口
 internal/
-  chat/chat.go            应用装配 + 无终端副作用的对话/会话业务
-  chat/ui.go              常驻 Bubble Tea 根模型 + 后台事件流
-  chat/input.go           可嵌入的 Unicode 单行编辑器
+  application/run.go      配置、模型、工具、会话和 UI 的启动装配
+  chat/chat.go            无终端依赖的对话/会话业务
   chat/image.go           图片命令解析 + 本地/远程图片多模态消息
-  chat/approver.go        Gate 与 Bubble Tea 之间的审核消息桥
-  chat/menu.go            可嵌入的 Bubble Tea + Lip Gloss 菜单
+  ui/model.go             根 Model 状态与 Init
+  ui/banner.go            结构化启动信息的展示文案
+  ui/update.go            根 Model 的事件和按键路由
+  ui/view.go              根 Model 的 View 与布局渲染
+  ui/conversation.go      提交命令和流式对话状态
+  ui/approver.go          Gate 与 Bubble Tea 的审批消息桥
+  ui/approval_update.go   根 Model 的审批状态更新
+  ui/approval_view.go     审批卡内容渲染
+  ui/sessions.go          会话选择 UI
+  ui/events.go            后台事件定义与消息通道
+  ui/error_model.go       独立启动错误 Model
+  ui/input/model.go       可嵌入的 Unicode 输入 Model
+  ui/menu/model.go        可嵌入的选择菜单 Model
   config/config.go        配置定义与校验
   config/dotenv.go        零依赖 .env 加载器
   logging/logging.go      运行日志 + eino 全局 callback
@@ -232,6 +258,9 @@ internal/
   approval/proposal.go    提案定义与状态常量
   approval/store.go       审核状态机 + JSONL 审计日志
   tools/registry.go       工具注册表（风险分级，强制变更工具过闸门）
+  tools/evidence.go       五类结构化只读采证工具及 Tunnel runner
+  tools/evidence_commands.go 固定只读命令模板
+  tools/evidence_parse.go 节点输出解析、聚合和状态判定
   tools/gate.go           人工审核闸门
   tools/risk.go           shell 命令风险启发式评估
   tools/tunnel.go         节点命令执行（真实远程执行，变更类）
@@ -248,13 +277,15 @@ test/                     全部 Go 测试用例（统一 package test）
 
 **只读工具返回结论，不返回原始数据。** 后续接入数据源时，时序指标应在 Go 层聚合成「均值 / 环比 / 拐点 / 是否越线」，模型拿到可直接推理的结构化判断。不要把几百个采样点丢给模型——慢、费 token、还容易读错。
 
+**只读节点工具不接受 Shell。** 五类采证工具只接收经过校验的节点 ID，并运行代码内固定的命令模板；流量采样秒数限制为 1～5。任意命令继续使用受 Gate 保护的 `run_tunnel_cmd`，不能因为某次命令被判断为只读就绕开人工审批。
+
 **mock 数据必须自报家门。** 若开发期重新加入 mock 工具，返回值必须带 `data_source=mock`，system prompt 要求模型说明数据不可信，避免被当成真实诊断依据。
 
 **工具入参字段必须导出。** 未导出字段既不会出现在 `utils.InferTool` 生成的 JSON Schema 里、也无法被 `encoding/json` 反序列化——模型永远传不进值，最后会执行一条空命令。`test/tools_gate_test.go` 里有针对 `run_tunnel_cmd` 的 schema 断言防这个回归。
 
-**流式输出消费 ADK 事件。** `ChatModelAgent` 会把模型输出和工具结果都发成事件。`internal/agent/agent.go` 只打印 assistant 事件，完整消费并关闭每条消息流；工具事件仍由 Gate 自己展示。这样模型调用工具前的说明、审核卡和最终结论保持正确顺序，同时会话历史只记录最后一条不含 tool call 的 assistant 消息。
+**流式输出消费 ADK 事件。** `ChatModelAgent` 会把模型输出和工具结果都发成事件。`internal/agent/agent.go` 只消费 assistant 事件并通过回调上报文本，不接触终端；`internal/ui` 再把文本、审批和工具回执统一渲染。这样模型调用工具前的说明、审核卡和最终结论保持正确顺序，同时会话历史只记录最后一条不含 tool call 的 assistant 消息。
 
-**终端交互只有一个 Bubble Tea 生命周期。** 根 Model 从启动到退出一直持有终端，`LineInputModel` 接收 `KeyRunes`，光标、退格和 Delete 都以完整 Unicode 字符为单位。提交后只切换根 Model 的模式，不退出输入程序，也不会为审批或会话列表创建嵌套的 Bubble Tea 程序。
+**终端交互只有一个 Bubble Tea 生命周期。** `internal/ui` 是独立 UI 包，根 `ui.Model` 从启动到退出一直持有终端；`ui/input.Model` 和 `ui/menu.Model` 只是嵌入式子模型。输入框接收 `KeyRunes`，光标、退格和 Delete 都以完整 Unicode 字符为单位。提交后只切换根 Model 的模式，不退出输入程序，也不会为审批或会话列表创建嵌套程序。`internal/chat` 不导入 Bubble Tea，启动装配集中在 `internal/application`。
 
 **Skill 只走渐进式披露。** Skill middleware 把名称和描述放进 `skill` 工具 schema，完整正文只有模型明确调用后才进入上下文。文件后端限制在 `AGENT_SKILLS_DIR` 内且只开放读取；符号链接解析后也必须仍在根目录内。fork Skill 需要单独设计子 Agent 的工具集和审批继承策略，当前在启动阶段直接拒绝。
 
@@ -268,7 +299,7 @@ test/                     全部 Go 测试用例（统一 package test）
 
 **图片输入在 OpenAI 和 Claude 间共用。** 输入 `/image ./error.png 帮我定位报错` 即可发送本地图片；路径含空格时可加引号，或写成 `/image /path/a b.png -- 帮我定位报错`。本地图片读取为原始 base64，Eino 的 OpenAI 适配器会转成 data URL，Claude 适配器会转成原始 base64 image block；HTTP/HTTPS URL 则直接传给模型。
 
-**确认卡在工具调用里，而不是卡在轮次之间。** 人工确认发生在 `InvokableRun` 内部，模型这一轮还没结束——它拿到的直接就是执行结果或驳回理由。后台 `UIApprover.Review` 等待根 Model 的回复；终端输入始终只有 Bubble Tea 一个读者。
+**确认卡在工具调用里，而不是卡在轮次之间。** 人工确认发生在 `InvokableRun` 内部，模型这一轮还没结束——它拿到的直接就是执行结果或驳回理由。后台 `ui.Approver.Review` 等待根 Model 的回复；终端输入始终只有 Bubble Tea 一个读者。
 
 ## 测试
 
@@ -276,7 +307,7 @@ test/                     全部 Go 测试用例（统一 package test）
 go test ./...
 ```
 
-`test/intent_test.go` 覆盖强制结构化工具调用、稳定枚举校验、低置信度澄清、上下文限制、图片保留和兼容网关 JSON 降级。`test/skills_test.go` 覆盖 Skill middleware 注入、正文加载和不支持模式的启动期拒绝。`test/chat_input_test.go` 覆盖中文退格、光标编辑、快捷删除和输入上限；`test/chat_ui_test.go` 覆盖根模型输入、流式事件、会话菜单和窗口约束。审批和工具用例覆盖 UI 决策回传、未确认不执行、逐次审核、失败默认拒绝、状态机幂等和变更工具强制包装。这些用例全程不连接任何真实节点。
+`test/intent_test.go` 覆盖强制结构化工具调用、稳定枚举校验、低置信度澄清、上下文限制、图片保留和兼容网关 JSON 降级。`test/skills_test.go` 覆盖 Skill middleware 注入、正文加载和不支持模式的启动期拒绝。`test/evidence_tools_test.go` 使用 fake runner 覆盖五类采证解析、Schema、风险注册、速率计算和非法参数拦截。`test/chat_input_test.go` 覆盖中文退格、光标编辑、快捷删除和输入上限；`test/chat_ui_test.go` 覆盖根模型输入、流式事件、会话菜单和窗口约束。审批和工具用例覆盖 UI 决策回传、未确认不执行、逐次审核、失败默认拒绝、状态机幂等和变更工具强制包装。这些用例全程不连接任何真实节点。
 
 需要检查并发问题时运行 `go test -race ./test`。
 
@@ -288,12 +319,11 @@ go test ./...
 
 完整范围、优先级与验收标准见 [`docs/requirements.md`](docs/requirements.md)。当前路线：
 
-1. **真实只读数据工具** —— 按故障域封装参数化聚合查询，不使用 text-to-SQL。
-2. **本地代码仓库问答** —— 以受限 Backend 复用 Eino 文件工具，补充 AST 符号索引和 `path:line` 引用回答。
-3. **故障类型子图** —— 用 `compose.Graph` 实现「分类 → 并行采证 → 证据校验 → 推理」，按业务域挂载工具。
-4. **装机异常专项流程** —— 打通截图错误、安装阶段、源码位置和设备证据。
-5. **提案持久化与异步审批** —— 用 Eino interrupt/checkpoint 管理暂停恢复，保留项目审批状态机并保证同一提案最多下发一次。
-6. **质量与可观测性** —— 恢复跳过用例，建设固定评测集和阶段指标。
+1. **本地代码仓库问答** —— 以受限 Backend 复用 Eino 文件工具，补充 AST 符号索引和 `path:line` 引用回答。
+2. **故障类型子图** —— 用 `compose.Graph` 实现「分类 → 并行采证 → 证据校验 → 推理」，按业务域挂载工具。
+3. **装机异常专项流程** —— 打通截图错误、安装阶段、源码位置和设备证据。
+4. **提案持久化与异步审批** —— 用 Eino interrupt/checkpoint 管理暂停恢复，保留项目审批状态机并保证同一提案最多下发一次。
+5. **质量与可观测性** —— 建设固定评测集和阶段指标。
 
 ## 版本
 

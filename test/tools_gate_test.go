@@ -373,16 +373,6 @@ func TestRegistryAcceptsGatedMutatingTool(t *testing.T) {
 	}
 }
 
-// 内置只读工具本身也要能注册，顺带保证 InferTool 的 schema 没写坏。
-func TestRegisterBuiltinReadOnlyTools(t *testing.T) {
-	t.Skip("内置只读工具已从当前工作区移除")
-}
-
-// device_id 必须是导出字段才能被 JSON 填进去；这里同时验证 schema 声明了它。
-func TestDeviceStatusToolAcceptsDeviceID(t *testing.T) {
-	t.Skip("设备状态 mock 工具已从当前工作区移除")
-}
-
 // tunnel 工具的 schema 必须真的声明 sn / cmd 两个参数。
 // 之前 Cmd 写成未导出的 cmd，schema 里根本没有这个参数，模型永远传不进命令。
 // 这里只检查 schema，不触发任何远程执行。

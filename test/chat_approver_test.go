@@ -10,8 +10,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"diagnostic-system/internal/approval"
-	. "diagnostic-system/internal/chat"
 	"diagnostic-system/internal/tools"
+	. "diagnostic-system/internal/ui"
 )
 
 func testProposal() (*approval.Proposal, tools.RiskAssessment) {
@@ -33,7 +33,7 @@ func TestUIApproverApproveThroughRootModel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	events := make(chan tea.Msg, 4)
-	approver := NewUIApprover(ctx, events, "tester")
+	approver := NewApprover(ctx, events, "tester")
 	p, risk := testProposal()
 
 	type outcome struct {
@@ -46,7 +46,7 @@ func TestUIApproverApproveThroughRootModel(t *testing.T) {
 		done <- outcome{decision: decision, err: err}
 	}()
 
-	model := NewModel(ctx, nil, events, "")
+	model := NewModel(ctx, nil, events, ModelConfig{})
 	model = updateRoot(t, model, <-events)
 	if model.Mode() != "approval" {
 		t.Fatalf("mode = %q, want approval", model.Mode())
@@ -71,7 +71,7 @@ func TestUIApproverRejectReasonThroughRootModel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	events := make(chan tea.Msg, 4)
-	approver := NewUIApprover(ctx, events, "tester")
+	approver := NewApprover(ctx, events, "tester")
 	p, risk := testProposal()
 
 	done := make(chan tools.Decision, 1)
@@ -80,7 +80,7 @@ func TestUIApproverRejectReasonThroughRootModel(t *testing.T) {
 		done <- decision
 	}()
 
-	model := NewModel(ctx, nil, events, "")
+	model := NewModel(ctx, nil, events, ModelConfig{})
 	model = updateRoot(t, model, <-events)
 	model = updateRoot(t, model, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
 	if model.Mode() != "rejection_reason" {
@@ -98,7 +98,7 @@ func TestUIApproverRejectReasonThroughRootModel(t *testing.T) {
 func TestUIApproverClosedUIFailsClosed(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	events := make(chan tea.Msg)
-	approver := NewUIApprover(ctx, events, "tester")
+	approver := NewApprover(ctx, events, "tester")
 	cancel()
 	p, risk := testProposal()
 
@@ -110,7 +110,7 @@ func TestUIApproverClosedUIFailsClosed(t *testing.T) {
 
 func TestUIApproverHonorsRequestCancellation(t *testing.T) {
 	events := make(chan tea.Msg)
-	approver := NewUIApprover(context.Background(), events, "tester")
+	approver := NewApprover(context.Background(), events, "tester")
 	p, risk := testProposal()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -123,13 +123,13 @@ func TestUIApproverHonorsRequestCancellation(t *testing.T) {
 
 func TestUIApproverNoticeUsesBubbleTeaEvent(t *testing.T) {
 	events := make(chan tea.Msg, 1)
-	approver := NewUIApprover(context.Background(), events, "tester")
+	approver := NewApprover(context.Background(), events, "tester")
 	p, _ := testProposal()
 	p.Status = approval.StatusFailed
 	p.Error = "调用超时"
 	approver.Notice(p)
 
-	model := NewModel(context.Background(), nil, events, "")
+	model := NewModel(context.Background(), nil, events, ModelConfig{})
 	model = updateRoot(t, model, <-events)
 	if !strings.Contains(model.TranscriptText(), "执行失败：调用超时") {
 		t.Fatalf("notice 未进入 UI transcript: %s", model.TranscriptText())
@@ -148,7 +148,7 @@ func TestApprovalCardDoesNotTruncateCommand(t *testing.T) {
 func TestUIApproverReviewWaitsForExplicitDecision(t *testing.T) {
 	events := make(chan tea.Msg, 1)
 	ctx, cancel := context.WithCancel(context.Background())
-	approver := NewUIApprover(ctx, events, "tester")
+	approver := NewApprover(ctx, events, "tester")
 	p, risk := testProposal()
 	done := make(chan struct{})
 	go func() {

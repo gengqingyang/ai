@@ -6,11 +6,13 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/cloudwego/eino/schema"
 
-	. "diagnostic-system/internal/chat"
+	"diagnostic-system/internal/chat"
 	"diagnostic-system/internal/intent"
 	"diagnostic-system/internal/session"
+	. "diagnostic-system/internal/ui"
 )
 
 type fakeConversationAgent struct{}
@@ -30,8 +32,8 @@ func newRootModel(t *testing.T, events chan tea.Msg) Model {
 		t.Fatal(err)
 	}
 	current, _ := store.Current()
-	app := NewApp(fakeConversationAgent{}, store, current, 1024, "auto")
-	return NewModel(context.Background(), app, events, "已启动")
+	app := chat.NewApp(fakeConversationAgent{}, store, current, 1024, "auto")
+	return NewModel(context.Background(), app, events, ModelConfig{Banner: "已启动", InputMaxBytes: 1024})
 }
 
 func TestRootModelUnicodeInputAndStreaming(t *testing.T) {
@@ -76,11 +78,11 @@ func TestRootModelSessionMenuSwitchesSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	app := NewApp(fakeConversationAgent{}, store, first, 1024, "auto")
+	app := chat.NewApp(fakeConversationAgent{}, store, first, 1024, "auto")
 	if _, err := app.SwitchSession(secondInfo.ID); err != nil {
 		t.Fatal(err)
 	}
-	model := NewModel(context.Background(), app, nil, "")
+	model := NewModel(context.Background(), app, nil, ModelConfig{InputMaxBytes: 1024})
 
 	model = updateRoot(t, model, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/sessions")})
 	model = updateRoot(t, model, tea.KeyMsg{Type: tea.KeyEnter})
@@ -103,7 +105,33 @@ func TestRootModelViewFitsConfiguredHeight(t *testing.T) {
 		model = updateRoot(t, model, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
 	}
 	view := model.View()
-	if lines := strings.Count(view, "\n"); lines > 12 {
-		t.Fatalf("View 高度=%d, want <=12:\n%s", lines, view)
+	if lines := strings.Count(view, "\n"); lines != 12 {
+		t.Fatalf("View 高度=%d, want 12:\n%s", lines, view)
+	}
+}
+
+func TestRootModelViewAdaptsToTerminalResize(t *testing.T) {
+	model := newRootModel(t, nil)
+	sizes := []tea.WindowSizeMsg{
+		{Width: 72, Height: 24},
+		{Width: 21, Height: 11},
+		{Width: 48, Height: 17},
+	}
+
+	for _, size := range sizes {
+		model = updateRoot(t, model, size)
+		view := model.View()
+		if got := strings.Count(view, "\n"); got != size.Height {
+			t.Errorf("窗口 %dx%d 下 View 高度=%d:\n%s", size.Width, size.Height, got, view)
+		}
+		lines := strings.Split(strings.TrimSuffix(view, "\n"), "\n")
+		if len(lines) < 3 || !strings.Contains(lines[len(lines)-3], "›") {
+			t.Errorf("窗口 %dx%d 下输入行没有固定在倒数第三行:\n%s", size.Width, size.Height, view)
+		}
+		for _, line := range lines {
+			if got := lipgloss.Width(line); got > size.Width {
+				t.Errorf("窗口 %dx%d 下行宽=%d: %q", size.Width, size.Height, got, line)
+			}
+		}
 	}
 }
