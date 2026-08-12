@@ -24,6 +24,7 @@ import (
 type Agent struct {
 	flows      map[Flow]adk.Agent
 	router     *Router
+	evidence   *EvidencePipeline
 	baseModel  model.ToolCallingChatModel
 	skillNames []string
 }
@@ -35,6 +36,10 @@ func New(ctx context.Context, cm model.ToolCallingChatModel, reg *tools.Registry
 		return nil, fmt.Errorf("创建意图分类器失败: %w", err)
 	}
 	router, err := NewRouter(ctx, classifier)
+	if err != nil {
+		return nil, err
+	}
+	evidence, err := NewEvidencePipeline(ctx, reg)
 	if err != nil {
 		return nil, err
 	}
@@ -68,6 +73,7 @@ func New(ctx context.Context, cm model.ToolCallingChatModel, reg *tools.Registry
 	return &Agent{
 		flows:      flows,
 		router:     router,
+		evidence:   evidence,
 		baseModel:  cm,
 		skillNames: skillNames,
 	}, nil
@@ -81,7 +87,19 @@ func toolsForFlow(reg *tools.Registry, spec flowSpec) ([]tool.BaseTool, error) {
 	if err != nil {
 		return nil, fmt.Errorf("创建 %s 工具白名单失败: %w", spec.flow, err)
 	}
-	return flowTools, nil
+	// 固定只读采证工具由前置 EvidencePipeline 执行。结论分支只保留代码工具
+	// 和受审核的补充命令，避免模型重复采集同一份当前快照。
+	filtered := make([]tool.BaseTool, 0, len(flowTools))
+	for _, candidate := range flowTools {
+		info, infoErr := candidate.Info(context.Background())
+		if infoErr != nil {
+			return nil, fmt.Errorf("读取 %s 分支工具信息失败: %w", spec.flow, infoErr)
+		}
+		if !isEvidenceTool(info.Name) {
+			filtered = append(filtered, candidate)
+		}
+	}
+	return filtered, nil
 }
 
 type flowSpec struct {
@@ -150,7 +168,11 @@ func (a *Agent) Generate(ctx context.Context, msgs []*schema.Message) (*schema.M
 		// 信息不足时绕开 ReAct，并在模型调用层禁用工具，硬性阻止节点命令。
 		return a.baseModel.Generate(ctx, input, model.WithToolChoice(schema.ToolChoiceForbidden))
 	}
-	return a.run(ctx, withRoutingContext(msgs, route.Classification), route.Flow, false, nil)
+	flowInput, err := a.withEvidence(ctx, msgs, route)
+	if err != nil {
+		return nil, err
+	}
+	return a.run(ctx, flowInput, route.Flow, false, nil)
 }
 
 // Stream 流式地跑一轮。ADK 会为每次模型输出产生事件；每收到一个文本片段就
@@ -173,7 +195,11 @@ func (a *Agent) Stream(
 		return StreamClarification(ctx, a.baseModel, WithSystemPrompt(msgs, route.Classification), onChunk)
 	}
 
-	reply, err := a.run(ctx, withRoutingContext(msgs, route.Classification), route.Flow, true, onChunk)
+	flowInput, err := a.withEvidence(ctx, msgs, route)
+	if err != nil {
+		return "", err
+	}
+	reply, err := a.run(ctx, flowInput, route.Flow, true, onChunk)
 	if err != nil {
 		return "", err
 	}
@@ -181,6 +207,22 @@ func (a *Agent) Stream(
 		return "", nil
 	}
 	return reply.Content, nil
+}
+
+func (a *Agent) withEvidence(ctx context.Context, msgs []*schema.Message, route Route) ([]*schema.Message, error) {
+	input := withRoutingContext(msgs, route.Classification)
+	if _, ok := evidenceSpecs[route.Flow]; !ok {
+		return input, nil
+	}
+	bundle, err := a.evidence.Run(ctx, EvidenceRequest{
+		Flow: route.Flow, Classification: route.Classification,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("执行诊断采证 Graph 失败: %w", err)
+	}
+	out := make([]*schema.Message, 0, len(input)+1)
+	out = append(out, input[0], schema.SystemMessage(bundle.routingContext()))
+	return append(out, input[1:]...), nil
 }
 
 // run consumes ADK events and returns the last assistant message without tool

@@ -18,6 +18,12 @@ const (
 	ToolPluginEvidence       = "get_plugin_evidence"
 	ToolKernelEvidence       = "get_kernel_evidence"
 	ToolNetworkEvidence      = "get_network_evidence"
+
+	InstallationEvidenceSource = "tunnel:systemd/procfs"
+	TrafficEvidenceSource      = "tunnel:sysfs"
+	PluginEvidenceSource       = "tunnel:systemd/procfs"
+	KernelEvidenceSource       = "tunnel:uname/rpm/grubby"
+	NetworkEvidenceSource      = "tunnel:iproute/procfs"
 )
 
 // ReadOnlyCommandOutput 是受限节点命令执行器返回的最小结果。
@@ -114,7 +120,7 @@ func NewEvidenceTools(runner ReadOnlyCommandRunner) ([]tool.BaseTool, error) {
 		"查询节点装机就绪度、系统状态、资源水位和安装相关进程；只执行固定只读命令。",
 		func(ctx context.Context, in nodeEvidenceInput) (EvidenceReport, error) {
 			return collectEvidence(ctx, runner, in.Node, "installation",
-				"tunnel:systemd/procfs", installationEvidenceCommand, parseInstallationEvidence,
+				InstallationEvidenceSource, installationEvidenceCommand, parseInstallationEvidence,
 				[]string{"当前快照不能替代装机平台的历史阶段记录。"})
 		},
 	)
@@ -135,7 +141,7 @@ func NewEvidenceTools(runner ReadOnlyCommandRunner) ([]tool.BaseTool, error) {
 			}
 			command := strings.ReplaceAll(trafficEvidenceCommand, "{{SAMPLE_SECONDS}}", strconv.Itoa(seconds))
 			return collectEvidence(ctx, runner, in.Node, "traffic",
-				"tunnel:sysfs", command, parseTrafficEvidence,
+				TrafficEvidenceSource, command, parseTrafficEvidence,
 				[]string{"仅反映默认网卡流量，不等同于 CDN 业务请求量或调度流量。"})
 		},
 	)
@@ -148,7 +154,7 @@ func NewEvidenceTools(runner ReadOnlyCommandRunner) ([]tool.BaseTool, error) {
 		"查询节点核心插件服务的加载、运行、退出状态和可执行文件位置；只执行固定只读命令。",
 		func(ctx context.Context, in nodeEvidenceInput) (EvidenceReport, error) {
 			return collectEvidence(ctx, runner, in.Node, "plugin",
-				"tunnel:systemd/procfs", pluginEvidenceCommand, parsePluginEvidence, nil)
+				PluginEvidenceSource, pluginEvidenceCommand, parsePluginEvidence, nil)
 		},
 	)
 	if err != nil {
@@ -160,7 +166,7 @@ func NewEvidenceTools(runner ReadOnlyCommandRunner) ([]tool.BaseTool, error) {
 		"查询节点当前、默认启动和已安装内核，判断升级是否已安装并切换；只执行固定只读命令。",
 		func(ctx context.Context, in nodeEvidenceInput) (EvidenceReport, error) {
 			return collectEvidence(ctx, runner, in.Node, "kernel",
-				"tunnel:uname/rpm/grubby", kernelEvidenceCommand, parseKernelEvidence, nil)
+				KernelEvidenceSource, kernelEvidenceCommand, parseKernelEvidence, nil)
 		},
 	)
 	if err != nil {
@@ -172,7 +178,7 @@ func NewEvidenceTools(runner ReadOnlyCommandRunner) ([]tool.BaseTool, error) {
 		"查询节点接口、地址、默认路由、DNS 和网卡错误计数；只执行固定只读命令。",
 		func(ctx context.Context, in nodeEvidenceInput) (EvidenceReport, error) {
 			return collectEvidence(ctx, runner, in.Node, "network",
-				"tunnel:iproute/procfs", networkEvidenceCommand, parseNetworkEvidence,
+				NetworkEvidenceSource, networkEvidenceCommand, parseNetworkEvidence,
 				[]string{"错误和丢包为开机后的累计计数，需要结合流量采样判断是否仍在增长。"})
 		},
 	)

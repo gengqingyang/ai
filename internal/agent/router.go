@@ -79,7 +79,7 @@ func NewRouter(ctx context.Context, classifier IntentClassifier) (*Router, error
 
 	endNodes := make(map[string]bool, len(allFlows))
 	for _, flow := range allFlows {
-		flow := flow	
+		flow := flow
 		endNodes[string(flow)] = true
 		if err := graph.AddLambdaNode(string(flow), compose.InvokableLambda(
 			func(_ context.Context, input classifiedInput) (Route, error) {
