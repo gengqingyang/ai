@@ -7,8 +7,9 @@ import (
 
 // ToolSummary 是启动页需要的工具元数据。
 type ToolSummary struct {
-	Name string
-	Risk string
+	Name    string
+	Risk    string
+	Domains []string
 }
 
 // StartupInfo 是启动装配层传给 UI 的结构化展示数据。
@@ -26,7 +27,11 @@ type StartupInfo struct {
 func StartupBanner(info StartupInfo) string {
 	toolNames := make([]string, 0, len(info.Tools))
 	for _, tool := range info.Tools {
-		toolNames = append(toolNames, fmt.Sprintf("%s [%s]", tool.Name, tool.Risk))
+		domains := "unscoped"
+		if len(tool.Domains) > 0 {
+			domains = strings.Join(tool.Domains, "+")
+		}
+		toolNames = append(toolNames, fmt.Sprintf("%s [%s; %s]", tool.Name, tool.Risk, domains))
 	}
 	loadedSkills := "无"
 	if len(info.Skills) > 0 {

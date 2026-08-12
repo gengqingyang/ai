@@ -129,6 +129,52 @@ func TestClassifierForcesClarificationForLowConfidenceAndUnknown(t *testing.T) {
 	}
 }
 
+func TestClassifierRequiresDeviceIDForDeviceOnlyFlows(t *testing.T) {
+	tests := []Kind{
+		TrafficAnomaly,
+		PluginFailure,
+		KernelUpgradeFailure,
+		NetworkConfigurationFailure,
+	}
+	for _, kind := range tests {
+		fake := &fakeToolCallingModel{reply: toolReply(resultJSON(t, Result{
+			Intent: kind, Confidence: 0.95, Summary: kind.Label() + "诊断",
+		}))}
+		classifier, err := New(fake)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := classifier.Classify(context.Background(), []*schema.Message{
+			schema.UserMessage("帮我看看"),
+		})
+		if err != nil {
+			t.Fatalf("Classify(%s) error=%v", kind, err)
+		}
+		if !got.NeedsClarification || len(got.MissingInformation) == 0 ||
+			!strings.Contains(got.MissingInformation[0], "设备") {
+			t.Fatalf("Classify(%s)=%#v, want device clarification", kind, got)
+		}
+	}
+
+	installation := &fakeToolCallingModel{reply: toolReply(resultJSON(t, Result{
+		Intent: InstallationFailure, Confidence: 0.95, Summary: "截图装机失败",
+		Evidence: []string{"截图含错误码 E1001"},
+	}))}
+	classifier, err := New(installation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := classifier.Classify(context.Background(), []*schema.Message{
+		schema.UserMessage("截图里是 E1001"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.NeedsClarification {
+		t.Fatalf("installation without device was forced to clarify: %#v", got)
+	}
+}
+
 func TestClassifierKeepsLatestImageAndLimitsRecentContext(t *testing.T) {
 	messages := make([]*schema.Message, 0, 8)
 	for i := 0; i < 7; i++ {

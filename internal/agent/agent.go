@@ -1,8 +1,4 @@
-// Package agent 组装 ReAct agent。
-//
-// 当前只有一个通用 agent。后续按故障类型拆诊断子图时，这里会变成
-// 「入口分类 → 各故障类型子图」的编排层，届时改用 compose.Graph，
-// 但对外暴露的 Agent 接口可以保持不变。
+// Package agent 组装入口 Graph 和各故障类型的 ReAct 子流程。
 package agent
 
 import (
@@ -14,6 +10,7 @@ import (
 
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/components/model"
+	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
 
@@ -25,22 +22,21 @@ import (
 
 // Agent 包装 ADK ChatModelAgent，屏蔽掉 Eino 的构造和事件细节。
 type Agent struct {
-	inner      *adk.ChatModelAgent
-	codeInner  *adk.ChatModelAgent
+	flows      map[Flow]adk.Agent
+	router     *Router
 	baseModel  model.ToolCallingChatModel
-	classifier *intent.Classifier
 	skillNames []string
 }
 
-// New 构造 ReAct agent。
-//
-// 挂载注册表里的全部工具。变更类工具在注册时已被 tools.Gate 包成「只生成
-// 提案」的门面（Registry 强制这一点），所以模型看得见、也能提议变更动作，
-// 但它手上那个工具没有执行能力——执行只发生在人工批准之后。
+// New 构造分类路由 Graph 和带独立 prompt、工具白名单的故障子流程。
 func New(ctx context.Context, cm model.ToolCallingChatModel, reg *tools.Registry, cfg *config.Config) (*Agent, error) {
 	classifier, err := intent.New(cm)
 	if err != nil {
 		return nil, fmt.Errorf("创建意图分类器失败: %w", err)
+	}
+	router, err := NewRouter(ctx, classifier)
+	if err != nil {
+		return nil, err
 	}
 
 	skillHandler, skillMatters, err := skills.Load(ctx, cfg.SkillsDir)
@@ -48,36 +44,21 @@ func New(ctx context.Context, cm model.ToolCallingChatModel, reg *tools.Registry
 		return nil, err
 	}
 
-	inner, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
-		Name:        "diagnostic-assistant",
-		Description: "CDN 业务智能诊断助手",
-		Instruction: SystemPrompt,
-		Model:       cm,
-		ToolsConfig: adk.ToolsConfig{
-			ToolsNodeConfig: compose.ToolsNodeConfig{Tools: reg.All()},
-		},
-		MaxIterations: cfg.MaxStep,
-		Handlers:      []adk.ChatModelAgentMiddleware{skillHandler},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("创建 ADK ChatModelAgent 失败: %w", err)
-	}
-	codeTools, err := reg.Named(tools.CodeToolNames()...)
-	if err != nil {
-		return nil, fmt.Errorf("创建代码工具白名单失败: %w", err)
-	}
-	codeInner, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
-		Name:        "code-repository-assistant",
-		Description: "本地代码仓库只读问答助手",
-		Instruction: CodePrompt,
-		Model:       cm,
-		ToolsConfig: adk.ToolsConfig{
-			ToolsNodeConfig: compose.ToolsNodeConfig{Tools: codeTools},
-		},
-		MaxIterations: cfg.MaxStep,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("创建代码仓库 Agent 失败: %w", err)
+	flows := make(map[Flow]adk.Agent, len(flowSpecs))
+	for _, spec := range flowSpecs {
+		flowTools, domainErr := toolsForFlow(reg, spec)
+		if domainErr != nil {
+			return nil, domainErr
+		}
+		handlers := []adk.ChatModelAgentMiddleware(nil)
+		if spec.useSkills {
+			handlers = []adk.ChatModelAgentMiddleware{skillHandler}
+		}
+		flowAgent, buildErr := newFlowAgent(ctx, cm, cfg.MaxStep, spec, flowTools, handlers)
+		if buildErr != nil {
+			return nil, buildErr
+		}
+		flows[spec.flow] = flowAgent
 	}
 
 	skillNames := make([]string, 0, len(skillMatters))
@@ -85,12 +66,72 @@ func New(ctx context.Context, cm model.ToolCallingChatModel, reg *tools.Registry
 		skillNames = append(skillNames, matter.Name)
 	}
 	return &Agent{
-		inner:      inner,
-		codeInner:  codeInner,
+		flows:      flows,
+		router:     router,
 		baseModel:  cm,
-		classifier: classifier,
 		skillNames: skillNames,
 	}, nil
+}
+
+func toolsForFlow(reg *tools.Registry, spec flowSpec) ([]tool.BaseTool, error) {
+	if len(spec.domains) == 0 {
+		return nil, nil
+	}
+	flowTools, err := reg.RequireDomains(spec.domains...)
+	if err != nil {
+		return nil, fmt.Errorf("创建 %s 工具白名单失败: %w", spec.flow, err)
+	}
+	return flowTools, nil
+}
+
+type flowSpec struct {
+	flow        Flow
+	name        string
+	description string
+	prompt      string
+	domains     []tools.Domain
+	useSkills   bool
+}
+
+var flowSpecs = []flowSpec{
+	{FlowInstallation, "installation-diagnostic", "装机异常专项诊断", InstallationPrompt,
+		[]tools.Domain{tools.DomainInstallation, tools.DomainCode}, true},
+	{FlowTraffic, "traffic-diagnostic", "业务流量异常诊断", TrafficPrompt,
+		[]tools.Domain{tools.DomainTraffic}, true},
+	{FlowPlugin, "plugin-diagnostic", "CDN 插件异常诊断", PluginPrompt,
+		[]tools.Domain{tools.DomainPlugin}, true},
+	{FlowKernel, "kernel-diagnostic", "内核升级失败诊断", KernelPrompt,
+		[]tools.Domain{tools.DomainKernel}, true},
+	{FlowNetwork, "network-diagnostic", "节点配网异常诊断", NetworkPrompt,
+		[]tools.Domain{tools.DomainNetwork}, true},
+	{FlowCode, "code-repository-assistant", "本地代码仓库只读问答", CodePrompt,
+		[]tools.Domain{tools.DomainCode}, false},
+	{FlowOther, "general-assistant", "非设备类问题处理", OtherPrompt, nil, false},
+}
+
+func newFlowAgent(
+	ctx context.Context,
+	cm model.ToolCallingChatModel,
+	maxIterations int,
+	spec flowSpec,
+	flowTools []tool.BaseTool,
+	handlers []adk.ChatModelAgentMiddleware,
+) (adk.Agent, error) {
+	inner, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+		Name:        spec.name,
+		Description: spec.description,
+		Instruction: spec.prompt,
+		Model:       cm,
+		ToolsConfig: adk.ToolsConfig{
+			ToolsNodeConfig: compose.ToolsNodeConfig{Tools: flowTools},
+		},
+		MaxIterations: maxIterations,
+		Handlers:      handlers,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("创建 %s 子流程失败: %w", spec.flow, err)
+	}
+	return inner, nil
 }
 
 // SkillNames 返回启动时已校验并挂载的 Skill 名称。
@@ -100,16 +141,16 @@ func (a *Agent) SkillNames() []string {
 
 // Generate 非流式地跑一轮，返回最终回复。
 func (a *Agent) Generate(ctx context.Context, msgs []*schema.Message) (*schema.Message, error) {
-	classification, err := a.classify(ctx, msgs)
+	route, err := a.route(ctx, msgs)
 	if err != nil {
 		return nil, err
 	}
-	input := WithSystemPrompt(msgs, classification)
-	if classification.NeedsClarification {
+	input := WithSystemPrompt(msgs, route.Classification)
+	if route.Flow == FlowClarification {
 		// 信息不足时绕开 ReAct，并在模型调用层禁用工具，硬性阻止节点命令。
 		return a.baseModel.Generate(ctx, input, model.WithToolChoice(schema.ToolChoiceForbidden))
 	}
-	return a.run(ctx, withRoutingContext(msgs, classification), classification, false, nil)
+	return a.run(ctx, withRoutingContext(msgs, route.Classification), route.Flow, false, nil)
 }
 
 // Stream 流式地跑一轮。ADK 会为每次模型输出产生事件；每收到一个文本片段就
@@ -120,19 +161,19 @@ func (a *Agent) Stream(
 	onIntent func(intent.Result),
 	onChunk func(string),
 ) (string, error) {
-	classification, err := a.classify(ctx, msgs)
+	route, err := a.route(ctx, msgs)
 	if err != nil {
 		return "", err
 	}
 	if onIntent != nil {
-		onIntent(classification)
+		onIntent(route.Classification)
 	}
 
-	if classification.NeedsClarification {
-		return StreamClarification(ctx, a.baseModel, WithSystemPrompt(msgs, classification), onChunk)
+	if route.Flow == FlowClarification {
+		return StreamClarification(ctx, a.baseModel, WithSystemPrompt(msgs, route.Classification), onChunk)
 	}
 
-	reply, err := a.run(ctx, withRoutingContext(msgs, classification), classification, true, onChunk)
+	reply, err := a.run(ctx, withRoutingContext(msgs, route.Classification), route.Flow, true, onChunk)
 	if err != nil {
 		return "", err
 	}
@@ -148,13 +189,13 @@ func (a *Agent) Stream(
 func (a *Agent) run(
 	ctx context.Context,
 	msgs []*schema.Message,
-	classification intent.Result,
+	flow Flow,
 	stream bool,
 	onChunk func(string),
 ) (*schema.Message, error) {
-	selected := a.inner
-	if classification.Intent == intent.CodeRepositoryQuestion {
-		selected = a.codeInner
+	selected, ok := a.flows[flow]
+	if !ok || selected == nil {
+		return nil, fmt.Errorf("诊断分支 %q 未初始化", flow)
 	}
 	runner := adk.NewRunner(ctx, adk.RunnerConfig{
 		Agent:           selected,
@@ -243,13 +284,15 @@ func startSegment(onChunk func(string), segments *int) {
 	(*segments)++
 }
 
-func (a *Agent) classify(ctx context.Context, msgs []*schema.Message) (intent.Result, error) {
-	result, err := a.classifier.Classify(ctx, msgs)
+func (a *Agent) route(ctx context.Context, msgs []*schema.Message) (Route, error) {
+	route, err := a.router.Select(ctx, msgs)
 	if err != nil {
-		return intent.Result{}, fmt.Errorf("意图识别失败: %w", err)
+		return Route{}, fmt.Errorf("意图识别失败: %w", err)
 	}
+	result := route.Classification
 	slog.Info("意图识别",
 		"intent", result.Intent,
+		"flow", route.Flow,
 		"confidence", result.Confidence,
 		"summary", result.Summary,
 		"evidence", result.Evidence,
@@ -257,7 +300,7 @@ func (a *Agent) classify(ctx context.Context, msgs []*schema.Message) (intent.Re
 		"device_ids", result.DeviceIDs,
 		"missing_information", result.MissingInformation,
 	)
-	return result, nil
+	return route, nil
 }
 
 // StreamClarification streams a reply while forbidding all tool calls.

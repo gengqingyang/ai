@@ -106,7 +106,9 @@ func registerTools(ctx context.Context, gate *tools.Gate, timeout time.Duration,
 		return nil, err
 	}
 	for _, codeTool := range codeTools {
-		if err := registry.Register(ctx, codeTool, tools.RiskReadOnly); err != nil {
+		if err := registry.RegisterInDomains(
+			ctx, codeTool, tools.RiskReadOnly, tools.DomainCode,
+		); err != nil {
 			return nil, fmt.Errorf("注册代码只读工具失败: %w", err)
 		}
 	}
@@ -114,8 +116,25 @@ func registerTools(ctx context.Context, gate *tools.Gate, timeout time.Duration,
 	if err != nil {
 		return nil, err
 	}
+	evidenceDomains := map[string]tools.Domain{
+		tools.ToolInstallationEvidence: tools.DomainInstallation,
+		tools.ToolTrafficEvidence:      tools.DomainTraffic,
+		tools.ToolPluginEvidence:       tools.DomainPlugin,
+		tools.ToolKernelEvidence:       tools.DomainKernel,
+		tools.ToolNetworkEvidence:      tools.DomainNetwork,
+	}
 	for _, evidenceTool := range evidenceTools {
-		if err := registry.Register(ctx, evidenceTool, tools.RiskReadOnly); err != nil {
+		info, infoErr := evidenceTool.Info(ctx)
+		if infoErr != nil {
+			return nil, fmt.Errorf("读取只读采证工具信息失败: %w", infoErr)
+		}
+		domain, ok := evidenceDomains[info.Name]
+		if !ok {
+			return nil, fmt.Errorf("只读采证工具 %q 没有配置业务域", info.Name)
+		}
+		if err := registry.RegisterInDomains(
+			ctx, evidenceTool, tools.RiskReadOnly, domain,
+		); err != nil {
 			return nil, fmt.Errorf("注册只读采证工具失败: %w", err)
 		}
 	}
@@ -128,7 +147,13 @@ func registerTools(ctx context.Context, gate *tools.Gate, timeout time.Duration,
 	if err != nil {
 		return nil, fmt.Errorf("包装 run_tunnel_cmd 失败: %w", err)
 	}
-	if err := registry.Register(ctx, gatedTunnel, tools.RiskMutating); err != nil {
+	if err := registry.RegisterInDomains(ctx, gatedTunnel, tools.RiskMutating,
+		tools.DomainInstallation,
+		tools.DomainTraffic,
+		tools.DomainPlugin,
+		tools.DomainKernel,
+		tools.DomainNetwork,
+	); err != nil {
 		return nil, err
 	}
 	return registry, nil
@@ -138,7 +163,13 @@ func startupInfo(cfg *config.Config, registry *tools.Registry, skillNames []stri
 	active session.Info, current *session.Session) ui.StartupInfo {
 	toolSummaries := make([]ui.ToolSummary, 0, len(registry.Entries()))
 	for _, entry := range registry.Entries() {
-		toolSummaries = append(toolSummaries, ui.ToolSummary{Name: entry.Name, Risk: entry.Risk.String()})
+		domains := make([]string, 0, len(entry.Domains))
+		for _, domain := range entry.Domains {
+			domains = append(domains, string(domain))
+		}
+		toolSummaries = append(toolSummaries, ui.ToolSummary{
+			Name: entry.Name, Risk: entry.Risk.String(), Domains: domains,
+		})
 	}
 	return ui.StartupInfo{
 		Config:      cfg.Redacted(),

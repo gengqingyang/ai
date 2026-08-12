@@ -185,7 +185,32 @@ func validateResult(result Result) (Result, error) {
 	if result.Intent == Unknown || result.Confidence < clarificationThreshold {
 		result.NeedsClarification = true
 	}
+	if requiresDeviceID(result.Intent) && len(result.DeviceIDs) == 0 {
+		result.NeedsClarification = true
+		result.MissingInformation = appendMissing(
+			result.MissingInformation,
+			"请提供要诊断的设备 SN、设备 ID 或节点 ID",
+		)
+	}
 	return result, nil
+}
+
+func requiresDeviceID(kind Kind) bool {
+	switch kind {
+	case TrafficAnomaly, PluginFailure, KernelUpgradeFailure, NetworkConfigurationFailure:
+		return true
+	default:
+		return false
+	}
+}
+
+func appendMissing(values []string, value string) []string {
+	for _, current := range values {
+		if current == value {
+			return values
+		}
+	}
+	return append(values, value)
 }
 
 func cleanStrings(values []string, unique bool) []string {

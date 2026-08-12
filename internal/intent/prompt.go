@@ -20,7 +20,8 @@ const classifierPrompt = `你是 CDN 运维诊断系统的入口意图分类器�
 5. summary 用一句中文概括用户当前诉求；evidence 只列用户或图片已经提供的事实。
 6. device_ids 提取明确出现的 SN、设备 ID 或节点 ID，不要编造。
 7. 装机截图已包含可搜索的错误原文或错误码时，可以直接进入源码诊断；设备 ID 不是必填项，不要仅因缺少设备 ID 要求澄清。
-8. 只有必须让用户补充信息后才能继续时，needs_clarification 才为 true，并在 missing_information 中列出具体问题。`
+8. 流量、插件运行、内核升级和配网异常必须有设备 ID 才能采集现场证据；未提供时 needs_clarification 必须为 true。
+9. 只有必须让用户补充信息后才能继续时，needs_clarification 才为 true，并在 missing_information 中列出具体问题。`
 
 const reportToolName = "report_intent"
 

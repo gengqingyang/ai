@@ -373,6 +373,82 @@ func TestRegistryAcceptsGatedMutatingTool(t *testing.T) {
 	}
 }
 
+func TestRegistryFiltersToolsByBusinessDomain(t *testing.T) {
+	ctx := context.Background()
+	reg := NewRegistry()
+	gate, _ := newTestGate()
+
+	code := newFakeMutating("search_code")
+	if err := reg.RegisterInDomains(ctx, code, RiskReadOnly, DomainCode); err != nil {
+		t.Fatal(err)
+	}
+	installation := newFakeMutating("get_installation_evidence")
+	if err := reg.RegisterInDomains(
+		ctx, installation, RiskReadOnly, DomainInstallation,
+	); err != nil {
+		t.Fatal(err)
+	}
+	gated, err := gate.Wrap(ctx, newFakeMutating("run_tunnel_cmd"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.RegisterInDomains(ctx, gated, RiskMutating,
+		DomainInstallation, DomainTraffic,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := toolNames(t, reg.InDomains(DomainCode)); !reflect.DeepEqual(got, []string{"search_code"}) {
+		t.Fatalf("code tools=%v", got)
+	}
+	if got := toolNames(t, reg.InDomains(DomainInstallation)); !reflect.DeepEqual(got,
+		[]string{"get_installation_evidence", "run_tunnel_cmd"}) {
+		t.Fatalf("installation tools=%v", got)
+	}
+	if got := toolNames(t, reg.InDomains(DomainTraffic)); !reflect.DeepEqual(got,
+		[]string{"run_tunnel_cmd"}) {
+		t.Fatalf("traffic tools=%v", got)
+	}
+	if got := reg.InDomains(Domain("unknown")); len(got) != 0 {
+		t.Fatalf("unknown domain selected %d tools", len(got))
+	}
+	if _, err := reg.RequireDomains(DomainNetwork); err == nil ||
+		!strings.Contains(err.Error(), "没有注册工具") {
+		t.Fatalf("missing domain error=%v", err)
+	}
+	if got, err := reg.RequireDomains(DomainCode, DomainInstallation); err != nil || len(got) != 3 {
+		t.Fatalf("RequireDomains() len=%d err=%v", len(got), err)
+	}
+
+	domains, ok := reg.DomainsOf("run_tunnel_cmd")
+	if !ok || !reflect.DeepEqual(domains, []Domain{DomainInstallation, DomainTraffic}) {
+		t.Fatalf("DomainsOf()=%v, %v", domains, ok)
+	}
+	domains[0] = DomainCode
+	again, _ := reg.DomainsOf("run_tunnel_cmd")
+	if again[0] == DomainCode {
+		t.Fatal("DomainsOf exposed registry storage")
+	}
+
+	if err := reg.RegisterInDomains(ctx, newFakeMutating("bad_domain"), RiskReadOnly,
+		Domain("database")); err == nil || !strings.Contains(err.Error(), "未知业务域") {
+		t.Fatalf("invalid domain error=%v", err)
+	}
+}
+
+func toolNames(t *testing.T, registered []tool.BaseTool) []string {
+	t.Helper()
+	names := make([]string, 0, len(registered))
+	for _, registeredTool := range registered {
+		info, err := registeredTool.Info(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, info.Name)
+	}
+	return names
+}
+
 // tunnel 工具的 schema 必须真的声明 sn / cmd 两个参数。
 // 之前 Cmd 写成未导出的 cmd，schema 里根本没有这个参数，模型永远传不进命令。
 // 这里只检查 schema，不触发任何远程执行。
