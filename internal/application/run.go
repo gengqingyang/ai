@@ -19,6 +19,7 @@ import (
 	"diagnostic-system/internal/config"
 	"diagnostic-system/internal/llm"
 	"diagnostic-system/internal/logging"
+	"diagnostic-system/internal/repository"
 	"diagnostic-system/internal/session"
 	"diagnostic-system/internal/tools"
 	"diagnostic-system/internal/ui"
@@ -58,7 +59,11 @@ func Run() error {
 		tools.WithApprover(approver),
 		tools.WithTimeout(cfg.ToolTimeout),
 	)
-	registry, err := registerTools(ctx, gate, cfg.ToolTimeout)
+	repositoryManager, err := repository.Open(cfg.RepositoryFile)
+	if err != nil {
+		return fmt.Errorf("打开代码仓库目录失败: %w", err)
+	}
+	registry, err := registerTools(ctx, gate, cfg.ToolTimeout, repositoryManager)
 	if err != nil {
 		return err
 	}
@@ -76,7 +81,7 @@ func Run() error {
 		return errors.New("会话存储没有当前会话")
 	}
 
-	chatApp := chat.NewApp(diagnosticAgent, sessionStore, currentSession, cfg.ImageMaxBytes, cfg.ImageDetail)
+	chatApp := chat.NewApp(diagnosticAgent, sessionStore, currentSession, cfg.ImageMaxBytes, cfg.ImageDetail, repositoryManager)
 	model := ui.NewModel(ctx, chatApp, events, ui.ModelConfig{
 		Banner: ui.StartupBanner(startupInfo(
 			cfg, registry, diagnosticAgent.SkillNames(), activeSession, currentSession,
@@ -93,8 +98,18 @@ func Run() error {
 	return nil
 }
 
-func registerTools(ctx context.Context, gate *tools.Gate, timeout time.Duration) (*tools.Registry, error) {
+func registerTools(ctx context.Context, gate *tools.Gate, timeout time.Duration,
+	repositoryManager *repository.Manager) (*tools.Registry, error) {
 	registry := tools.NewRegistry()
+	codeTools, err := tools.NewCodeTools(repositoryManager)
+	if err != nil {
+		return nil, err
+	}
+	for _, codeTool := range codeTools {
+		if err := registry.Register(ctx, codeTool, tools.RiskReadOnly); err != nil {
+			return nil, fmt.Errorf("注册代码只读工具失败: %w", err)
+		}
+	}
 	evidenceTools, err := tools.NewTunnelEvidenceTools(timeout)
 	if err != nil {
 		return nil, err

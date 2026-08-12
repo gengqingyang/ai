@@ -26,6 +26,7 @@ import (
 // Agent 包装 ADK ChatModelAgent，屏蔽掉 Eino 的构造和事件细节。
 type Agent struct {
 	inner      *adk.ChatModelAgent
+	codeInner  *adk.ChatModelAgent
 	baseModel  model.ToolCallingChatModel
 	classifier *intent.Classifier
 	skillNames []string
@@ -61,6 +62,23 @@ func New(ctx context.Context, cm model.ToolCallingChatModel, reg *tools.Registry
 	if err != nil {
 		return nil, fmt.Errorf("创建 ADK ChatModelAgent 失败: %w", err)
 	}
+	codeTools, err := reg.Named(tools.CodeToolNames()...)
+	if err != nil {
+		return nil, fmt.Errorf("创建代码工具白名单失败: %w", err)
+	}
+	codeInner, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+		Name:        "code-repository-assistant",
+		Description: "本地代码仓库只读问答助手",
+		Instruction: CodePrompt,
+		Model:       cm,
+		ToolsConfig: adk.ToolsConfig{
+			ToolsNodeConfig: compose.ToolsNodeConfig{Tools: codeTools},
+		},
+		MaxIterations: cfg.MaxStep,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("创建代码仓库 Agent 失败: %w", err)
+	}
 
 	skillNames := make([]string, 0, len(skillMatters))
 	for _, matter := range skillMatters {
@@ -68,6 +86,7 @@ func New(ctx context.Context, cm model.ToolCallingChatModel, reg *tools.Registry
 	}
 	return &Agent{
 		inner:      inner,
+		codeInner:  codeInner,
 		baseModel:  cm,
 		classifier: classifier,
 		skillNames: skillNames,
@@ -90,7 +109,7 @@ func (a *Agent) Generate(ctx context.Context, msgs []*schema.Message) (*schema.M
 		// 信息不足时绕开 ReAct，并在模型调用层禁用工具，硬性阻止节点命令。
 		return a.baseModel.Generate(ctx, input, model.WithToolChoice(schema.ToolChoiceForbidden))
 	}
-	return a.run(ctx, withRoutingContext(msgs, classification), false, nil)
+	return a.run(ctx, withRoutingContext(msgs, classification), classification, false, nil)
 }
 
 // Stream 流式地跑一轮。ADK 会为每次模型输出产生事件；每收到一个文本片段就
@@ -113,7 +132,7 @@ func (a *Agent) Stream(
 		return StreamClarification(ctx, a.baseModel, WithSystemPrompt(msgs, classification), onChunk)
 	}
 
-	reply, err := a.run(ctx, withRoutingContext(msgs, classification), true, onChunk)
+	reply, err := a.run(ctx, withRoutingContext(msgs, classification), classification, true, onChunk)
 	if err != nil {
 		return "", err
 	}
@@ -129,11 +148,16 @@ func (a *Agent) Stream(
 func (a *Agent) run(
 	ctx context.Context,
 	msgs []*schema.Message,
+	classification intent.Result,
 	stream bool,
 	onChunk func(string),
 ) (*schema.Message, error) {
+	selected := a.inner
+	if classification.Intent == intent.CodeRepositoryQuestion {
+		selected = a.codeInner
+	}
 	runner := adk.NewRunner(ctx, adk.RunnerConfig{
-		Agent:           a.inner,
+		Agent:           selected,
 		EnableStreaming: stream,
 	})
 	iter := runner.Run(ctx, msgs)

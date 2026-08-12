@@ -11,6 +11,7 @@ import (
 
 	"diagnostic-system/internal/chat"
 	"diagnostic-system/internal/intent"
+	"diagnostic-system/internal/repository"
 	uiinput "diagnostic-system/internal/ui/input"
 )
 
@@ -40,6 +41,18 @@ func (m Model) submit(line string) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "/sessions", "/session":
 		m.openSessions()
+		return m, nil
+	case "/repos":
+		m.appendEntry(roleSystem, repositoriesText(m.app.Repositories()))
+		return m, nil
+	case "/repo":
+		info, err := m.app.RunRepositoryCommand(m.ctx, line)
+		if err != nil {
+			m.appendEntry(roleError, err.Error())
+		} else {
+			m.appendEntry(roleStatus, fmt.Sprintf("当前代码仓库：%s（%d 文件，%d 符号，commit %s）",
+				info.Name, info.FileCount, info.SymbolCount, shortCommit(info.GitCommit)))
+		}
 		return m, nil
 	case "/new":
 		info, err := m.app.CreateSession(chat.CommandArgs(line))
@@ -159,13 +172,16 @@ func imageSummary(meta chat.ImageMeta) string {
 }
 
 func messageSummary(msg *schema.Message) string {
-	prefix := ""
+	return messageImagePrefix(msg) + oneLine(msg.Content)
+}
+
+func messageImagePrefix(msg *schema.Message) string {
 	if images := messageImageCount(msg); images == 1 {
-		prefix = "[图片] "
+		return "[图片] "
 	} else if images > 1 {
-		prefix = fmt.Sprintf("[图片 x%d] ", images)
+		return fmt.Sprintf("[图片 x%d] ", images)
 	}
-	return prefix + oneLine(msg.Content)
+	return ""
 }
 
 func messageImageCount(msg *schema.Message) int {
@@ -188,5 +204,32 @@ func oneLine(text string) string {
 
 func helpText() string {
 	return "直接输入问题即可。命令：/sessions 选择会话 | /new [名称] 新建 | " +
-		"/switch ID 切换 | /image <路径或 URL> [问题] | /history | /reset | /help | /exit"
+		"/switch ID 切换 | /image <路径或 URL> [问题] | /repos | " +
+		"/repo add|use|reindex | /history | /reset | /help | /exit"
+}
+
+func repositoriesText(items []repository.Info) string {
+	if len(items) == 0 {
+		return "尚未添加代码仓库。使用 /repo add <path> [name] 添加。"
+	}
+	var out strings.Builder
+	for _, item := range items {
+		marker := " "
+		if item.Active {
+			marker = "*"
+		}
+		fmt.Fprintf(&out, "%s %s · %d 文件 · %d 符号 · %s\n  %s\n",
+			marker, item.Name, item.FileCount, item.SymbolCount, shortCommit(item.GitCommit), item.Root)
+	}
+	return strings.TrimSpace(out.String())
+}
+
+func shortCommit(commit string) string {
+	if commit == "" {
+		return "无 Git 版本"
+	}
+	if len(commit) > 12 {
+		return commit[:12]
+	}
+	return commit
 }

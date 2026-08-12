@@ -77,8 +77,12 @@ func (m *Model) showHistory() {
 		if message.Role == schema.User {
 			role = roleUser
 		}
-		m.appendEntry(role, messageSummary(message))
+		m.appendEntry(role, historyMessageContent(message))
 	}
+}
+
+func historyMessageContent(message *schema.Message) string {
+	return messageImagePrefix(message) + message.Content
 }
 
 func sessionOption(info session.Info) string {

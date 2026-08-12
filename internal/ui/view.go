@@ -13,11 +13,11 @@ func (m Model) View() string {
 	width := max(1, m.viewWidth())
 	header := m.renderHeader(width)
 	footer := m.renderFooter(width)
+	bodyHeight := max(0, m.height-lineCount(header)-lineCount(footer))
 	body := m.renderBody(width)
 
 	if m.height > 0 {
-		available := max(0, m.height-lineCount(header)-lineCount(footer))
-		body = visibleTailLines(body, available, m.scrollOffset)
+		body = m.newScrollViewport(width, bodyHeight).View()
 	}
 	return header + body + footer
 }
@@ -66,7 +66,7 @@ func (m Model) renderFooter(width int) string {
 	switch m.mode {
 	case modeInput:
 		return rule + m.input.View() + "\n" + metaStyle.Render(menu.TruncateCells(
-			"Enter 发送 · PgUp/PgDn 滚动 · /help 命令 · Ctrl-C 退出", width)) + "\n"
+			"Enter 发送 · 滚轮/PgUp/PgDn 滚动 · /help 命令 · Ctrl-C 退出", width)) + "\n"
 	case modeBusy:
 		return rule + statusStyle.Render(menu.TruncateCells(
 			"正在处理，请稍候 · Ctrl-C 取消并退出", width)) + "\n"
@@ -162,24 +162,6 @@ func wrapCells(text string, width int) []string {
 		flush()
 	}
 	return lines
-}
-
-func visibleTailLines(text string, limit, offset int) string {
-	if limit <= 0 {
-		return ""
-	}
-	if text == "" {
-		return strings.Repeat("\n", limit)
-	}
-	lines := strings.Split(strings.TrimSuffix(text, "\n"), "\n")
-	end := max(0, len(lines)-max(0, offset))
-	if end < limit {
-		end = min(len(lines), limit)
-	}
-	end = min(end, len(lines))
-	start := max(0, end-limit)
-	visible := lines[start:end]
-	return strings.Join(visible, "\n") + "\n" + strings.Repeat("\n", limit-len(visible))
 }
 
 func lineCount(text string) int {

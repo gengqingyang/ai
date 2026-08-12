@@ -20,6 +20,10 @@ make run
 | `/new [名称]` | 新建一个空会话并立即切换 |
 | `/switch <ID 或名称>` | 按短 ID 或唯一名称切换 |
 | `/image <路径或 URL> [问题]` | 发送图片并提问，支持 PNG/JPEG/GIF/WebP |
+| `/repo add <路径> [名称]` | 添加、索引并切换到本地代码仓库；含空格参数可加引号 |
+| `/repos` | 列出已添加仓库和当前仓库 |
+| `/repo use <名称>` | 切换当前代码仓库 |
+| `/repo reindex` | 增量更新当前仓库索引 |
 | `/history` | 回看当前会话的对话历史 |
 | `/reset` | 清空当前会话的内存及本地历史 |
 | `/help` | 帮助 |
@@ -97,6 +101,23 @@ Agent 注册了五个使用固定命令模板的节点采证工具：
 
 当前流量证据只代表节点默认网卡，不等于 CDN 业务请求量；装机证据是节点当前快照，不替代装机平台的历史阶段数据。工具会在结果中显式返回这些限制。
 
+## 本地代码仓库问答
+
+先添加一个仓库：
+
+```text
+/repo add /path/to/installer installer
+/image ./install-error.png 帮我定位这个装机错误
+```
+
+代码问答提供 `list_files`、`search_code`、`read_file`、`find_symbol`、`find_references`、`get_definition` 和 `get_repository_revision` 七个只读工具。文件访问通过 Eino filesystem 协议的 `LocalRepoBackend`，写入和编辑固定拒绝，也不提供 Shell。Go 文件建立 AST 定义、引用和调用位置索引，其他 UTF-8 文本使用逐行检索。
+
+安全扫描默认排除 `.git`、`.env`、私钥、日志、聊天历史、二进制、生成目录、软链接和超过 2MB 的文件。工具只接受当前仓库内已进入索引的相对路径，越界路径和被排除文件无法读取。仓库目录只持久化规范根路径、Git commit、索引版本和更新时间，不保存源码正文。
+
+纯代码问题会进入只挂载上述七个工具的代码 Agent，看不到 Tunnel 和设备工具。装机异常采用“截图错误文本 → 源码定义/引用 → 可选设备证据”的顺序；设备无法连接时仍可给出带 `path:line` 的候选原因。文件或 Git commit 变化后结果会标记 `stale=true`，需运行 `/repo reindex`。
+
+`read_file` 单页最多返回 200 行。模型请求更大范围时工具会自动截取一页，并用 `has_more` 和 `next_start_line` 指示下一页；越过文件末尾返回结构化 `eof`，不会因为普通分页参数导致整轮对话失败。
+
 ## 意图识别
 
 入口分类器使用独立的 report_intent 输出 schema，不执行任何工具。OpenAI 和 Claude 都通过强制 tool choice 返回同一份结构化结果，包含意图、置信度、摘要、证据、设备 ID、缺失信息和是否需要澄清。
@@ -110,6 +131,7 @@ Agent 注册了五个使用固定命令模板的节点采证工具：
 | plugin_failure | 插件异常 |
 | kernel_upgrade_failure | 内核升级失败 |
 | network_configuration_failure | 配网异常 |
+| code_repository_question | 本地代码仓库问答 |
 | other | 其他已明确问题 |
 | unknown | 信息不足，无法可靠分类 |
 
@@ -151,6 +173,7 @@ ENV_FILE=/path/to/prod.env go run ./cmd/chat   # 指定别的配置文件
 | `AGENT_HISTORY_TURNS` | `0` | 历史轮数硬上限；`0` 表示不限 |
 | `AGENT_HISTORY_TOKENS` | `900000` | 历史消息预算，给 system、工具和回复预留 100K |
 | `AGENT_HISTORY_FILE` | `.chat_history.json` | 多会话索引；历史正文存入相邻的 `.chat_history_sessions/` |
+| `AGENT_REPOSITORY_FILE` | `.repositories.json` | 命名代码仓库目录；只保存路径和索引元数据，不保存源码 |
 | `AGENT_IMAGE_MAX_BYTES` | `20971520` | 单张本地图片最大字节数（默认 20MB） |
 | `AGENT_IMAGE_DETAIL` | `auto` | 图片理解精度：`auto` / `low` / `high` |
 | `TOOL_TIMEOUT` | `60s` | 单次工具执行超时（写 `60` 按秒算）；不含等人审核的时间 |
@@ -252,6 +275,7 @@ internal/
   logging/logging.go      运行日志 + eino 全局 callback
   llm/model.go            ChatModel 工厂 —— 换模型供应商只改这里
   intent/                  结构化入口分类、稳定意图枚举与路由上下文
+  repository/              安全仓库目录、Eino 只读 Backend、AST/文本索引和 Git 元数据
   skills/skills.go        只读本地 Skill 后端 + frontmatter 校验 + middleware 构造
   agent/agent.go          ADK ChatModelAgent 组装 + Skill handler + ADK 事件流消费
   agent/prompt.go         system prompt
@@ -261,6 +285,7 @@ internal/
   tools/evidence.go       五类结构化只读采证工具及 Tunnel runner
   tools/evidence_commands.go 固定只读命令模板
   tools/evidence_parse.go 节点输出解析、聚合和状态判定
+  tools/code.go           七个结构化只读代码工具
   tools/gate.go           人工审核闸门
   tools/risk.go           shell 命令风险启发式评估
   tools/tunnel.go         节点命令执行（真实远程执行，变更类）
@@ -278,6 +303,8 @@ test/                     全部 Go 测试用例（统一 package test）
 **只读工具返回结论，不返回原始数据。** 后续接入数据源时，时序指标应在 Go 层聚合成「均值 / 环比 / 拐点 / 是否越线」，模型拿到可直接推理的结构化判断。不要把几百个采样点丢给模型——慢、费 token、还容易读错。
 
 **只读节点工具不接受 Shell。** 五类采证工具只接收经过校验的节点 ID，并运行代码内固定的命令模板；流量采样秒数限制为 1～5。任意命令继续使用受 Gate 保护的 `run_tunnel_cmd`，不能因为某次命令被判断为只读就绕开人工审批。
+
+**代码仓库只开放安全索引。** `LocalRepoBackend` 实现 Eino filesystem 协议，但 `Write` 和 `Edit` 固定失败，也没有 Shell 能力。所有文件查询都限定在当前命名仓库的索引内；软链接、凭证、日志、二进制和生成文件在扫描阶段即被排除。纯代码意图使用独立 Agent，只挂代码工具白名单。
 
 **mock 数据必须自报家门。** 若开发期重新加入 mock 工具，返回值必须带 `data_source=mock`，system prompt 要求模型说明数据不可信，避免被当成真实诊断依据。
 
@@ -307,7 +334,7 @@ test/                     全部 Go 测试用例（统一 package test）
 go test ./...
 ```
 
-`test/intent_test.go` 覆盖强制结构化工具调用、稳定枚举校验、低置信度澄清、上下文限制、图片保留和兼容网关 JSON 降级。`test/skills_test.go` 覆盖 Skill middleware 注入、正文加载和不支持模式的启动期拒绝。`test/evidence_tools_test.go` 使用 fake runner 覆盖五类采证解析、Schema、风险注册、速率计算和非法参数拦截。`test/chat_input_test.go` 覆盖中文退格、光标编辑、快捷删除和输入上限；`test/chat_ui_test.go` 覆盖根模型输入、流式事件、会话菜单和窗口约束。审批和工具用例覆盖 UI 决策回传、未确认不执行、逐次审核、失败默认拒绝、状态机幂等和变更工具强制包装。这些用例全程不连接任何真实节点。
+`test/intent_test.go` 覆盖强制结构化工具调用、稳定枚举校验、代码/装机路由、低置信度澄清、上下文限制和图片保留。`test/repository_test.go` 覆盖 AST 定义/引用、精确行号、增量重索引、版本过期、Eino 只读 Backend、路径穿越、密钥和软链接隔离；`test/code_tools_test.go` 覆盖七个代码工具的 Schema、结构化输出和只读注册。`test/evidence_tools_test.go` 使用 fake runner 覆盖五类节点采证。UI、审批和工具测试继续覆盖 Bubble Tea 命令入口、Unicode 输入、会话、人工确认和变更工具强制包装。自动化测试不会连接真实节点。
 
 需要检查并发问题时运行 `go test -race ./test`。
 
@@ -319,11 +346,10 @@ go test ./...
 
 完整范围、优先级与验收标准见 [`docs/requirements.md`](docs/requirements.md)。当前路线：
 
-1. **本地代码仓库问答** —— 以受限 Backend 复用 Eino 文件工具，补充 AST 符号索引和 `path:line` 引用回答。
-2. **故障类型子图** —— 用 `compose.Graph` 实现「分类 → 并行采证 → 证据校验 → 推理」，按业务域挂载工具。
-3. **装机异常专项流程** —— 打通截图错误、安装阶段、源码位置和设备证据。
-4. **提案持久化与异步审批** —— 用 Eino interrupt/checkpoint 管理暂停恢复，保留项目审批状态机并保证同一提案最多下发一次。
-5. **质量与可观测性** —— 建设固定评测集和阶段指标。
+1. **故障类型子图** —— 用 `compose.Graph` 实现「分类 → 并行采证 → 证据校验 → 推理」，按业务域挂载工具。
+2. **装机异常专项流程** —— 固化“截图 → 源码 → 可选设备证据”链路和版本一致性判断。
+3. **提案持久化与异步审批** —— 用 Eino interrupt/checkpoint 管理暂停恢复，保留项目审批状态机并保证同一提案最多下发一次。
+4. **质量与可观测性** —— 建设固定评测集和阶段指标。
 
 ## 版本
 

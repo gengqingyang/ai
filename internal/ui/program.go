@@ -12,6 +12,7 @@ func Run(ctx context.Context, model tea.Model) (tea.Model, error) {
 		model,
 		tea.WithContext(ctx),
 		tea.WithAltScreen(),
+		tea.WithMouseCellMotion(),
 		tea.WithoutSignalHandler(),
 	).Run()
 }

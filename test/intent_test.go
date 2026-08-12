@@ -225,6 +225,25 @@ func TestRoutingContextMarksMetadataAndBlocksCommandsWhenClarifying(t *testing.T
 	}
 }
 
+func TestCodeAndInstallationRoutingConstraints(t *testing.T) {
+	code := (Result{Intent: CodeRepositoryQuestion, Confidence: 0.95, Summary: "查询调用方"}).RoutingContext()
+	for _, want := range []string{"代码仓库问答", "禁止调用 Tunnel", "path:line"} {
+		if !strings.Contains(code, want) {
+			t.Errorf("code routing=%q, want %q", code, want)
+		}
+	}
+	if CodeRepositoryQuestion.Label() != "代码仓库问答" || !CodeRepositoryQuestion.Valid() {
+		t.Fatalf("code_repository_question label/valid 不正确")
+	}
+
+	installation := (Result{Intent: InstallationFailure, Confidence: 0.95, Summary: "截图装机失败"}).RoutingContext()
+	for _, want := range []string{"优先", "源码", "设备 ID 不是"} {
+		if !strings.Contains(installation, want) {
+			t.Errorf("installation routing=%q, want %q", installation, want)
+		}
+	}
+}
+
 func TestClassifierPropagatesModelError(t *testing.T) {
 	modelErr := errors.New("gateway unavailable")
 	fake := &fakeToolCallingModel{generateErr: modelErr}

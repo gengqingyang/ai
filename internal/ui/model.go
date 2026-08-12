@@ -79,11 +79,12 @@ type Model struct {
 	approval   *approvalRequestMsg
 	sessions   []session.Info
 
-	inputMaxBytes int
-	requestCancel context.CancelFunc
-	width         int
-	height        int
-	scrollOffset  int
+	inputMaxBytes  int
+	requestCancel  context.CancelFunc
+	width          int
+	height         int
+	scrollOffset   int
+	scrollDragging bool
 }
 
 // NewModel 创建根 UI。events 为 nil 时可在测试中手工投递消息。

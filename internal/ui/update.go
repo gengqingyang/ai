@@ -54,6 +54,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		updated, _ := m.input.Update(size)
 		m.input = updated.(uiinput.Model)
 		m.resizeMenu()
+		m.clampScrollOffset()
 		return m, nil
 	}
 
@@ -64,12 +65,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if key, ok := msg.(tea.KeyMsg); ok {
 		switch key.Type {
 		case tea.KeyPgUp:
-			m.scrollOffset += max(1, (m.height-7)/2)
+			m.scrollBy(m.scrollPageSize())
 			return m, nil
 		case tea.KeyPgDown:
-			m.scrollOffset = max(0, m.scrollOffset-max(1, (m.height-7)/2))
+			m.scrollBy(-m.scrollPageSize())
 			return m, nil
 		}
+	}
+	if mouse, ok := msg.(tea.MouseMsg); ok && m.updateScrollMouse(mouse) {
+		return m, nil
 	}
 
 	switch m.mode {

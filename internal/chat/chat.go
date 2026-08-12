@@ -11,6 +11,7 @@ import (
 	"github.com/cloudwego/eino/schema"
 
 	"diagnostic-system/internal/intent"
+	"diagnostic-system/internal/repository"
 	"diagnostic-system/internal/session"
 )
 
@@ -26,18 +27,23 @@ type App struct {
 	sess          *session.Session
 	imageMaxBytes int
 	imageDetail   string
+	repositories  *repository.Manager
 }
 
 // NewApp 创建聊天应用实例。
 func NewApp(ag ConversationAgent, sessions *session.Store, sess *session.Session,
-	imageMaxBytes int, imageDetail string) *App {
-	return &App{
+	imageMaxBytes int, imageDetail string, repositories ...*repository.Manager) *App {
+	app := &App{
 		agent:         ag,
 		sessions:      sessions,
 		sess:          sess,
 		imageMaxBytes: imageMaxBytes,
 		imageDetail:   imageDetail,
 	}
+	if len(repositories) > 0 {
+		app.repositories = repositories[0]
+	}
+	return app
 }
 
 // CurrentSession 返回当前选中的会话。
@@ -134,6 +140,38 @@ func (a *App) SwitchSession(query string) (session.Info, error) {
 // Sessions 返回会话选择器的数据。
 func (a *App) Sessions() []session.Info { return a.sessions.List() }
 
+// Repositories 返回已登记的本地代码仓库。
+func (a *App) Repositories() []repository.Info {
+	if a.repositories == nil {
+		return nil
+	}
+	return a.repositories.List()
+}
+
+// AddRepository 添加、索引并切换到一个本地代码仓库。
+func (a *App) AddRepository(ctx context.Context, path, name string) (repository.Info, error) {
+	if a.repositories == nil {
+		return repository.Info{}, errors.New("仓库管理器未配置")
+	}
+	return a.repositories.Add(ctx, path, name)
+}
+
+// UseRepository 切换当前代码仓库。
+func (a *App) UseRepository(ctx context.Context, name string) (repository.Info, error) {
+	if a.repositories == nil {
+		return repository.Info{}, errors.New("仓库管理器未配置")
+	}
+	return a.repositories.Use(ctx, name)
+}
+
+// ReindexRepository 增量更新当前代码仓库索引。
+func (a *App) ReindexRepository(ctx context.Context) (repository.Info, error) {
+	if a.repositories == nil {
+		return repository.Info{}, errors.New("仓库管理器未配置")
+	}
+	return a.repositories.Reindex(ctx)
+}
+
 var errQuit = errors.New("quit")
 
 // RunCommand 保留纯业务命令入口，供非 UI 调用和测试使用；不会读写终端。
@@ -150,8 +188,11 @@ func (a *App) RunCommand(ctx context.Context, line string) (bool, error) {
 		return true, errQuit
 	case "/reset":
 		return true, a.ResetSession()
-	case "/history", "/sessions", "/session", "/help":
+	case "/history", "/sessions", "/session", "/repos", "/help":
 		return true, nil
+	case "/repo":
+		_, err := a.RunRepositoryCommand(ctx, line)
+		return true, err
 	case "/new":
 		_, err := a.CreateSession(CommandArgs(line))
 		return true, err
@@ -172,6 +213,92 @@ func (a *App) RunCommand(ctx context.Context, line string) (bool, error) {
 	default:
 		return true, fmt.Errorf("未知命令 %s，输入 /help 查看可用命令", fields[0])
 	}
+}
+
+// RunRepositoryCommand 执行仓库管理命令。路径或名称含空格时可以使用单/双引号。
+func (a *App) RunRepositoryCommand(ctx context.Context, line string) (repository.Info, error) {
+	fields, err := commandWords(line)
+	if err != nil {
+		return repository.Info{}, err
+	}
+	if len(fields) < 2 {
+		return repository.Info{}, errors.New("用法: /repo add <path> [name] | /repo use <name> | /repo reindex")
+	}
+	switch fields[1] {
+	case "add":
+		if len(fields) < 3 {
+			return repository.Info{}, errors.New("用法: /repo add <path> [name]")
+		}
+		return a.AddRepository(ctx, fields[2], strings.Join(fields[3:], " "))
+	case "use":
+		if len(fields) < 3 {
+			return repository.Info{}, errors.New("用法: /repo use <name>")
+		}
+		return a.UseRepository(ctx, strings.Join(fields[2:], " "))
+	case "reindex":
+		if len(fields) != 2 {
+			return repository.Info{}, errors.New("用法: /repo reindex")
+		}
+		return a.ReindexRepository(ctx)
+	default:
+		return repository.Info{}, fmt.Errorf("未知仓库命令 %q", fields[1])
+	}
+}
+
+func commandWords(line string) ([]string, error) {
+	var words []string
+	var current strings.Builder
+	var quote rune
+	escaped := false
+	started := false
+	flush := func() {
+		if started {
+			words = append(words, current.String())
+			current.Reset()
+			started = false
+		}
+	}
+	for _, r := range line {
+		if escaped {
+			current.WriteRune(r)
+			started = true
+			escaped = false
+			continue
+		}
+		if r == '\\' {
+			escaped = true
+			started = true
+			continue
+		}
+		if quote != 0 {
+			if r == quote {
+				quote = 0
+			} else {
+				current.WriteRune(r)
+			}
+			started = true
+			continue
+		}
+		if r == '\'' || r == '"' {
+			quote = r
+			started = true
+			continue
+		}
+		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+			flush()
+			continue
+		}
+		current.WriteRune(r)
+		started = true
+	}
+	if escaped {
+		return nil, errors.New("命令末尾不能是转义符")
+	}
+	if quote != 0 {
+		return nil, errors.New("命令参数的引号没有闭合")
+	}
+	flush()
+	return words, nil
 }
 
 // CommandArgs 返回命令名后的原始参数，并保留名称内部空格。

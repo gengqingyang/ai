@@ -105,6 +105,19 @@ func (r *Registry) Mutating() []tool.BaseTool {
 	return r.filter(func(e Entry) bool { return e.Risk == RiskMutating })
 }
 
+// Named 按给定顺序返回工具。缺少任何工具都报错，避免安全工具白名单静默失效。
+func (r *Registry) Named(names ...string) ([]tool.BaseTool, error) {
+	out := make([]tool.BaseTool, 0, len(names))
+	for _, name := range names {
+		entry, ok := r.entries[name]
+		if !ok {
+			return nil, fmt.Errorf("工具 %q 未注册", name)
+		}
+		out = append(out, entry.Tool)
+	}
+	return out, nil
+}
+
 // RiskOf 查询某个工具的风险等级。
 func (r *Registry) RiskOf(name string) (Risk, bool) {
 	e, ok := r.entries[name]

@@ -3,3 +3,4 @@ bin/
 *.log
 .chat_history.json
 .chat_history_sessions/
+.repositories.json
