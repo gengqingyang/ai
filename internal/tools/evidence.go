@@ -217,8 +217,31 @@ func collectEvidence(
 	if err := parser(output.Stdout, &report); err != nil {
 		return EvidenceReport{}, fmt.Errorf("解析节点 %s 的 %s 证据失败: %w", node, domain, err)
 	}
+	normalizedTime, err := normalizeEvidenceTime(report.CollectedAt)
+	if err != nil {
+		return EvidenceReport{}, fmt.Errorf("解析节点 %s 的 %s 采集时间失败: %w", node, domain, err)
+	}
+	report.CollectedAt = normalizedTime
 	finalizeEvidence(&report)
 	return report, nil
+}
+
+func normalizeEvidenceTime(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", errors.New("collected_at 为空")
+	}
+	formats := []string{
+		time.RFC3339Nano,
+		"2006-01-02T15:04:05.999999999Z0700",
+	}
+	for _, format := range formats {
+		parsed, err := time.Parse(format, value)
+		if err == nil {
+			return parsed.Format(time.RFC3339Nano), nil
+		}
+	}
+	return "", fmt.Errorf("collected_at %q 不是支持的 RFC3339 或 date -Ins 格式", value)
 }
 
 func validateNodeID(node string) error {

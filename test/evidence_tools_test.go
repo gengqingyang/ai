@@ -260,6 +260,39 @@ func TestEvidenceRunnerErrorIsReturnedWithContext(t *testing.T) {
 	}
 }
 
+func TestEvidenceToolsNormalizeGNUDateInsTimestamp(t *testing.T) {
+	runner := &fakeEvidenceRunner{stdoutOverride: strings.Join([]string{
+		"kv\tcollected_at\t2026-08-12T20:53:42,416118102+0800",
+		"kv\tsystem_state\trunning",
+	}, "\n")}
+	installation := evidenceToolByName(t, runner, projecttools.ToolInstallationEvidence)
+	output, err := installation.InvokableRun(context.Background(), `{"node":"SN001"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var report projecttools.EvidenceReport
+	if err := json.Unmarshal([]byte(output), &report); err != nil {
+		t.Fatal(err)
+	}
+	const want = "2026-08-12T20:53:42.416118102+08:00"
+	if report.CollectedAt != want {
+		t.Fatalf("CollectedAt=%q, want %q", report.CollectedAt, want)
+	}
+}
+
+func TestEvidenceToolsRejectInvalidCollectedAt(t *testing.T) {
+	runner := &fakeEvidenceRunner{stdoutOverride: strings.Join([]string{
+		"kv\tcollected_at\tnot-a-time",
+		"kv\tsystem_state\trunning",
+	}, "\n")}
+	installation := evidenceToolByName(t, runner, projecttools.ToolInstallationEvidence)
+	_, err := installation.InvokableRun(context.Background(), `{"node":"SN001"}`)
+	if err == nil || !strings.Contains(err.Error(), "SN001") ||
+		!strings.Contains(err.Error(), "采集时间") || !strings.Contains(err.Error(), "not-a-time") {
+		t.Fatalf("InvokableRun() error=%v", err)
+	}
+}
+
 func TestTrafficEvidenceDoesNotTreatMissingCounterAsZero(t *testing.T) {
 	runner := &fakeEvidenceRunner{stdoutOverride: strings.Join([]string{
 		"kv\tcollected_at\t2026-08-11T12:00:00+08:00",
