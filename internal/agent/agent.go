@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/components/model"
@@ -172,7 +173,7 @@ func (a *Agent) Generate(ctx context.Context, msgs []*schema.Message) (*schema.M
 	if err != nil {
 		return nil, err
 	}
-	return a.run(ctx, flowInput, route.Flow, false, nil)
+	return a.run(ctx, flowInput, route.Flow, false, nil, nil, nil)
 }
 
 // Stream 流式地跑一轮。ADK 会为每次模型输出产生事件；每收到一个文本片段就
@@ -183,6 +184,29 @@ func (a *Agent) Stream(
 	onIntent func(intent.Result),
 	onChunk func(string),
 ) (string, error) {
+	return a.stream(ctx, msgs, onIntent, nil, nil, onChunk)
+}
+
+// StreamWithProgress 在普通回复外上报 Agent 阶段、工具轨迹和模型提供的思考摘要。
+func (a *Agent) StreamWithProgress(
+	ctx context.Context,
+	msgs []*schema.Message,
+	onIntent func(intent.Result),
+	onProgress func(string),
+	onReasoning func(string),
+	onChunk func(string),
+) (string, error) {
+	return a.stream(ctx, msgs, onIntent, onProgress, onReasoning, onChunk)
+}
+
+func (a *Agent) stream(
+	ctx context.Context,
+	msgs []*schema.Message,
+	onIntent func(intent.Result),
+	onProgress func(string),
+	onReasoning func(string),
+	onChunk func(string),
+) (string, error) {
 	route, err := a.route(ctx, msgs)
 	if err != nil {
 		return "", err
@@ -190,16 +214,25 @@ func (a *Agent) Stream(
 	if onIntent != nil {
 		onIntent(route.Classification)
 	}
+	notifyProgress(onProgress, flowStartedText(route.Flow))
 
 	if route.Flow == FlowClarification {
-		return StreamClarification(ctx, a.baseModel, WithSystemPrompt(msgs, route.Classification), onChunk)
+		return streamClarification(
+			ctx, a.baseModel, WithSystemPrompt(msgs, route.Classification), onReasoning, onChunk,
+		)
 	}
 
+	if _, ok := evidenceSpecs[route.Flow]; ok {
+		notifyProgress(onProgress, "正在并行采集并校验只读设备证据。")
+	}
 	flowInput, err := a.withEvidence(ctx, msgs, route)
 	if err != nil {
 		return "", err
 	}
-	reply, err := a.run(ctx, flowInput, route.Flow, true, onChunk)
+	if _, ok := evidenceSpecs[route.Flow]; ok {
+		notifyProgress(onProgress, "只读设备证据已完成，正在交给模型分析。")
+	}
+	reply, err := a.run(ctx, flowInput, route.Flow, true, onProgress, onReasoning, onChunk)
 	if err != nil {
 		return "", err
 	}
@@ -233,6 +266,8 @@ func (a *Agent) run(
 	msgs []*schema.Message,
 	flow Flow,
 	stream bool,
+	onProgress func(string),
+	onReasoning func(string),
 	onChunk func(string),
 ) (*schema.Message, error) {
 	selected, ok := a.flows[flow]
@@ -246,7 +281,8 @@ func (a *Agent) run(
 	iter := runner.Run(ctx, msgs)
 
 	var final *schema.Message
-	segments := 0
+	answerSegments := 0
+	reasoningSegments := 0
 	for {
 		event, ok := iter.Next()
 		if !ok {
@@ -262,13 +298,26 @@ func (a *Agent) run(
 			continue
 		}
 		output := event.Output.MessageOutput
+		if output.Role == schema.Tool {
+			name := output.ToolName
+			if name == "" {
+				name = "工具"
+			}
+			notifyProgress(onProgress, fmt.Sprintf("%s 已完成，正在分析返回结果。", name))
+			continue
+		}
 		if output.Role != schema.Assistant {
 			continue
 		}
 
-		msg, err := consumeMessageOutput(output, onChunk, &segments)
+		msg, err := consumeMessageOutput(
+			output, onReasoning, onChunk, &reasoningSegments, &answerSegments,
+		)
 		if err != nil {
 			return final, err
+		}
+		if msg != nil && len(msg.ToolCalls) > 0 {
+			notifyProgress(onProgress, "调用工具："+toolCallNames(msg.ToolCalls))
 		}
 		if msg != nil && len(msg.ToolCalls) == 0 {
 			final = msg
@@ -276,11 +325,21 @@ func (a *Agent) run(
 	}
 }
 
-func consumeMessageOutput(output *adk.MessageVariant, onChunk func(string), segments *int) (*schema.Message, error) {
+func consumeMessageOutput(
+	output *adk.MessageVariant,
+	onReasoning func(string),
+	onChunk func(string),
+	reasoningSegments *int,
+	answerSegments *int,
+) (*schema.Message, error) {
 	if !output.IsStreaming {
 		msg := output.Message
+		if msg != nil && msg.ReasoningContent != "" && onReasoning != nil {
+			startSegment(onReasoning, reasoningSegments)
+			onReasoning(msg.ReasoningContent)
+		}
 		if msg != nil && msg.Content != "" && onChunk != nil {
-			startSegment(onChunk, segments)
+			startSegment(onChunk, answerSegments)
 			onChunk(msg.Content)
 		}
 		return msg, nil
@@ -291,7 +350,8 @@ func consumeMessageOutput(output *adk.MessageVariant, onChunk func(string), segm
 	defer output.MessageStream.Close()
 
 	chunks := make([]*schema.Message, 0, 8)
-	started := false
+	answerStarted := false
+	reasoningStarted := false
 	for {
 		chunk, err := output.MessageStream.Recv()
 		if errors.Is(err, io.EOF) {
@@ -301,10 +361,17 @@ func consumeMessageOutput(output *adk.MessageVariant, onChunk func(string), segm
 			return nil, err
 		}
 		chunks = append(chunks, chunk)
+		if chunk != nil && chunk.ReasoningContent != "" && onReasoning != nil {
+			if !reasoningStarted {
+				startSegment(onReasoning, reasoningSegments)
+				reasoningStarted = true
+			}
+			onReasoning(chunk.ReasoningContent)
+		}
 		if chunk != nil && chunk.Content != "" && onChunk != nil {
-			if !started {
-				startSegment(onChunk, segments)
-				started = true
+			if !answerStarted {
+				startSegment(onChunk, answerSegments)
+				answerStarted = true
 			}
 			onChunk(chunk.Content)
 		}
@@ -324,6 +391,43 @@ func startSegment(onChunk func(string), segments *int) {
 		onChunk("\n")
 	}
 	(*segments)++
+}
+
+func notifyProgress(callback func(string), text string) {
+	if callback != nil && text != "" {
+		callback(text)
+	}
+}
+
+func toolCallNames(calls []schema.ToolCall) string {
+	names := make([]string, 0, len(calls))
+	seen := make(map[string]struct{}, len(calls))
+	for _, call := range calls {
+		name := call.Function.Name
+		if name == "" {
+			name = "未知工具"
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	return strings.Join(names, "、")
+}
+
+func flowStartedText(flow Flow) string {
+	labels := map[Flow]string{
+		FlowClarification: "信息澄清",
+		FlowInstallation:  "装机异常诊断",
+		FlowTraffic:       "业务流量诊断",
+		FlowPlugin:        "插件异常诊断",
+		FlowKernel:        "内核升级诊断",
+		FlowNetwork:       "网络配置诊断",
+		FlowCode:          "代码仓库问答",
+		FlowOther:         "通用问答",
+	}
+	return fmt.Sprintf("已进入%s流程，正在规划下一步。", labels[flow])
 }
 
 func (a *Agent) route(ctx context.Context, msgs []*schema.Message) (Route, error) {
@@ -352,6 +456,16 @@ func StreamClarification(
 	msgs []*schema.Message,
 	onChunk func(string),
 ) (string, error) {
+	return streamClarification(ctx, baseModel, msgs, nil, onChunk)
+}
+
+func streamClarification(
+	ctx context.Context,
+	baseModel model.ToolCallingChatModel,
+	msgs []*schema.Message,
+	onReasoning func(string),
+	onChunk func(string),
+) (string, error) {
 	sr, err := baseModel.Stream(
 		ctx,
 		msgs,
@@ -363,6 +477,7 @@ func StreamClarification(
 	defer sr.Close()
 
 	chunks := make([]*schema.Message, 0, 8)
+	reasoningStarted := false
 	for {
 		chunk, err := sr.Recv()
 		if errors.Is(err, io.EOF) {
@@ -379,6 +494,12 @@ func StreamClarification(
 			return "", err
 		}
 		chunks = append(chunks, chunk)
+		if onReasoning != nil && chunk != nil && chunk.ReasoningContent != "" {
+			if !reasoningStarted {
+				reasoningStarted = true
+			}
+			onReasoning(chunk.ReasoningContent)
+		}
 		if onChunk != nil && chunk != nil && chunk.Content != "" {
 			onChunk(chunk.Content)
 		}

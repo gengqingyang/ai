@@ -112,11 +112,11 @@ Agent 注册了五个使用固定命令模板的节点采证工具：
 
 代码问答提供 `list_files`、`search_code`、`read_file`、`find_symbol`、`find_references`、`get_definition` 和 `get_repository_revision` 七个只读工具。文件访问通过 Eino filesystem 协议的 `LocalRepoBackend`，写入和编辑固定拒绝，也不提供 Shell。Go 文件建立 AST 定义、引用和调用位置索引，其他 UTF-8 文本使用逐行检索。
 
-安全扫描默认排除 `.git`、`.env`、私钥、日志、聊天历史、二进制、生成目录、软链接和超过 2MB 的文件。工具只接受当前仓库内已进入索引的相对路径，越界路径和被排除文件无法读取。仓库目录只持久化规范根路径、Git commit、索引版本和更新时间，不保存源码正文。
+安全扫描默认排除 `.git`、`.env`、私钥、日志、聊天历史及其会话目录、`.repositories.json`、`.approvals.json`、二进制、生成目录、软链接和超过 2MB 的文件。工具只接受当前仓库内已进入索引的相对路径，越界路径和被排除文件无法读取。仓库目录只持久化规范根路径、Git commit、索引版本和更新时间，不保存源码正文。
 
 入口使用 `compose.Graph` 把分类结果路由到装机、流量、插件、内核、配网、代码问答、澄清或其他分支。五类诊断各有独立 prompt；工具注册表同时记录风险和业务域，每个分支只绑定自己的工具白名单。纯代码分支只挂载上述七个工具，看不到 Tunnel 和设备工具。
 
-装机分支采用“截图错误文本 → 源码定义/引用 → 可选设备证据”的顺序；设备 ID 不是源码诊断前置条件，设备无法连接时仍可给出带 `path:line` 的候选原因。输出要求把截图事实、源码事实和设备事实分开，版本无法核实时不得把候选写成已确认根因。文件或 Git commit 变化后结果会标记 `stale=true`，需运行 `/repo reindex`。
+装机分支采用“截图错误文本 → 源码定义/引用 → 可选设备证据”的顺序；设备 ID 不是源码诊断前置条件，设备无法连接时仍可给出带 `path:line` 的候选原因。输出要求把截图事实、源码事实和设备事实分开，版本无法核实时不得把候选写成已确认根因。可索引源码文件或 Git commit 变化后结果会标记 `stale=true`，并通过 `stale_reasons` 区分提交变化和工作区文件变化；运行 `/repo reindex` 后恢复。
 
 `read_file` 单页最多返回 200 行。模型请求更大范围时工具会自动截取一页，并用 `has_more` 和 `next_start_line` 指示下一页；越过文件末尾返回结构化 `eof`，不会因为普通分页参数导致整轮对话失败。
 
@@ -147,9 +147,9 @@ Agent 注册了五个使用固定命令模板的节点采证工具：
 
 **光标默认停在「执行」**——确认多数时候都是放行，高频路径不该每次多按一下方向键。回车即下发到节点，输出直接回到模型手里，同一轮里继续推理；选「拒绝」后可以补一句理由，理由回喂给模型让它换方案。所以卡片把命令原文单独一行摊开：回车之前看清楚那一行。
 
-整个终端只有一个常驻 Bubble Tea 程序。主输入、流式回复、意图、错误、会话列表、审批卡、驳回理由和执行回执都由同一个 `Model/Update/View` 管理；后台 Agent 只向 UI 消息通道投递事件，不直接读写终端。
+整个终端只有一个常驻 Bubble Tea 程序。主输入、流式回复、意图、Agent 执行过程、模型返回的思考摘要、错误、会话列表、审批卡、驳回理由和执行回执都由同一个 `Model/Update/View` 管理；后台 Agent 只向 UI 消息通道投递事件，不直接读写终端。当前执行器已经是 Eino ADK `ChatModelAgent`，会展示流程阶段和工具开始/完成轨迹；供应商返回 `reasoning_content` 时会额外显示“思考”条目。模型内部隐藏推理不会被伪造或输出。
 
-确认菜单支持 `↑↓`（或 `←→`、`j`/`k`）移动，回车确认，`y`/`n` 直接选择，`Esc`/`q` 安全取消审批；`Ctrl-C` 取消当前请求并退出程序。主输入按 Unicode 字符编辑，因此中文退格一次删除一个完整字符；支持 `←/→`、`Home/End`、`Delete`、`Ctrl-W`、`Ctrl-U` 和 `Ctrl-K`。长内容可用 `PgUp/PgDn` 滚动查看。
+确认菜单支持 `↑↓`（或 `←→`、`j`/`k`）移动，回车确认，`y`/`n` 直接选择，`Esc`/`q` 安全取消审批；`Ctrl-C` 取消当前请求并退出程序。主输入按 Unicode 字符编辑，因此中文退格一次删除一个完整字符；支持 `↑/↓` 浏览当前会话已提交的输入，支持 `←/→`、`Home/End`、`Delete`、`Ctrl-W`、`Ctrl-U` 和 `Ctrl-K` 编辑。长内容可在默认交互模式中使用鼠标滚轮或 `PgUp/PgDn` 滚动查看。需要复制时按 `F2` 进入复制模式，直接用鼠标拖选文字并使用系统复制快捷键；按 `F2` 或 `Esc` 返回交互模式，恢复鼠标滚轮和滚动条拖拽。复制模式中仍可使用 `PgUp/PgDn` 滚动。请求处理期间输入栏保持显示但不可编辑。
 
 配置的优先级是**真实环境变量 > .env 文件 > 内置默认值**，所以可以临时覆盖单项而不改文件：
 
@@ -176,6 +176,7 @@ ENV_FILE=/path/to/prod.env go run ./cmd/chat   # 指定别的配置文件
 | `AGENT_HISTORY_TOKENS` | `900000` | 历史消息预算，给 system、工具和回复预留 100K |
 | `AGENT_HISTORY_FILE` | `.chat_history.json` | 多会话索引；历史正文存入相邻的 `.chat_history_sessions/` |
 | `AGENT_REPOSITORY_FILE` | `.repositories.json` | 命名代码仓库目录；只保存路径和索引元数据，不保存源码 |
+| `AGENT_APPROVAL_FILE` | `.approvals.json` | 提案、原始参数、决定、执行权和结果的持久化状态文件 |
 | `AGENT_IMAGE_MAX_BYTES` | `20971520` | 单张本地图片最大字节数（默认 20MB） |
 | `AGENT_IMAGE_DETAIL` | `auto` | 图片理解精度：`auto` / `low` / `high` |
 | `TOOL_TIMEOUT` | `60s` | 单次工具执行超时（写 `60` 按秒算）；不含等人审核的时间 |
@@ -203,11 +204,13 @@ ENV_FILE=/path/to/prod.env go run ./cmd/chat   # 指定别的配置文件
 - 确认发生在**模型这一轮之内**：`GatedTool.InvokableRun` 里同步问人，拿到答复才决定是否放行。批准后模型拿到 `status=executed` 和设备真实输出，拒绝则拿到 `status=rejected` 和理由——它不需要、也没机会去猜发生了什么。
 - `Registry.Register` 拒绝注册非 `*GatedTool` 的 `RiskMutating` 工具——漏包装会在**启动阶段崩掉**，而不是等某天真在客户设备上跑了才发现。
 - 批准时回放的是提案里存的**原始参数**，不做任何二次加工：审核人看到的和实际执行的必须是同一个东西。
-- 状态机 `pending → approved → executed/failed`（或 `pending → rejected`）带前置状态校验，一条提案不会被重复批准、也不会绕过批准直接执行。
+- 状态机 `pending → approved → executing → executed/failed/unknown`（或 `pending → rejected`）带前置状态校验。进入 `executing` 必须先原子持久化抢占执行权，只有抢占成功的调用才可触发真实工具。
+- `AGENT_APPROVAL_FILE` 使用版本化 JSON、`0600` 权限和原子替换保存提案、原始参数、幂等键及 checkpoint/interrupt 关联。替换前写盘失败会回滚内存；替换后目录同步失败会保留更严格的新状态并阻止后续动作，避免执行权退回。重启后待审和已批准提案仍可查询。
+- 若进程在取得执行权后、结果落盘前退出，启动恢复会把 `executing` 保守转换为 `unknown`。此状态表示命令可能已经生效，是不可自动重试的终态；恢复调用也不能修改原审核人或原始参数。
 - 每次状态流转追加一行 JSON 到 `AUDIT_LOG`，含提案 ID、工具、完整参数、审核人、时间、执行结果。
 - **失败方向朝安全那边倒**：审核环节报错、Ctrl-C 中断或 Bubble Tea 界面关闭，全部当作「未批准」。`ui.Approver` 不读取 stdin，而是把提案送进根 Model 后同步等待明确决定；没有收到 UI 回传就绝不执行。
 
-不配 `Approver` 时闸门退回异步模式：只登记提案、返回 `pending_approval`，等外部管理程序调用 `Execute`/`Reject`。
+不配 `Approver` 时闸门退回异步模式：只登记并持久化提案、返回 `pending_approval`，等外部管理程序调用 `Execute`/`Reject`。当前项目侧状态和执行权已经可恢复；Eino `StatefulInterrupt`、checkpoint store 和 Runner Resume 尚未接入。
 
 ### 风险等级
 
@@ -235,10 +238,10 @@ OpenAI 兼容端点的空闲连接会在 30 秒后回收，避免长工具调用
 
 ```
 ▶ 已批准（root），正在节点上执行…
-✗ 执行失败：调用超时：等了 60s 仍未返回，命令可能还在节点上跑，请稍后自行核实结果
+✗ 执行结果未知：调用超时：等了 60s 仍未返回，命令可能还在节点上跑，请稍后自行核实结果；请核实实际状态，禁止自动重试。
 ```
 
-终端红字回执、审计日志的 `error` 字段、回喂给模型的 `error` 字段，用的是同一句话。`context deadline exceeded` 这类原文会先翻成人话再往外递——对着审核人弹英文原文等于没说。system prompt 另外要求模型碰到超时如实说明结果未知、改用只读命令核实，而不是把同一条命令再发一遍。
+终端红字回执、状态文件、审计日志的 `error` 字段和回喂给模型的 `error` 字段使用同一语义。`context deadline exceeded` 这类原文会先翻成人话再往外递。超时或执行期间取消统一进入 `unknown`；system prompt 要求模型改用只读证据核实，而不是重发同一条命令。
 
 ## 日志
 
@@ -336,7 +339,7 @@ test/                     全部 Go 测试用例（统一 package test）
 go test ./...
 ```
 
-`test/intent_test.go` 覆盖强制结构化工具调用、稳定枚举校验、代码/装机路由、低置信度澄清、上下文限制和图片保留。`test/repository_test.go` 覆盖 AST 定义/引用、精确行号、增量重索引、版本过期、Eino 只读 Backend、路径穿越、密钥和软链接隔离；`test/code_tools_test.go` 覆盖七个代码工具的 Schema、结构化输出和只读注册。`test/evidence_tools_test.go` 使用 fake runner 覆盖五类节点采证。UI、审批和工具测试继续覆盖 Bubble Tea 命令入口、Unicode 输入、会话、人工确认和变更工具强制包装。自动化测试不会连接真实节点。
+`test/intent_test.go` 覆盖强制结构化工具调用、稳定枚举校验、代码/装机路由、低置信度澄清、上下文限制和图片保留。`test/repository_test.go` 覆盖 AST 定义/引用、精确行号、增量重索引、版本过期、Eino 只读 Backend、路径穿越、密钥和软链接隔离；`test/code_tools_test.go` 覆盖七个代码工具的 Schema、结构化输出和只读注册。`test/evidence_tools_test.go` 使用 fake runner 覆盖五类节点采证。UI、审批和工具测试继续覆盖 Bubble Tea 命令入口、Unicode 输入、会话、人工确认和变更工具强制包装。自动化测试不会连接真实模型或节点。
 
 需要检查并发问题时运行 `go test -race ./test`。
 
@@ -348,9 +351,9 @@ go test ./...
 
 完整范围、优先级与验收标准见 [`docs/requirements.md`](docs/requirements.md)。当前路线：
 
-1. **装机链路评测** —— 为已打通的“截图 → 源码 → 可选设备证据”补充固定多模态样例和版本一致性评测。
-2. **提案持久化与异步审批** —— 用 Eino interrupt/checkpoint 管理暂停恢复，保留项目审批状态机并保证同一提案最多下发一次。
-3. **质量与可观测性** —— 建设固定评测集和阶段指标，持续验证已完成的分类、并行采证、独立校验和结论链路。
+1. **Eino 审批暂停与恢复** —— 提案持久化和原子执行权已完成；下一阶段接入 `StatefulInterrupt`、持久化 checkpoint store 和 Runner Resume，通过 `proposal_id` 回查原始参数与决定。
+2. **真实异常诊断** —— 基于后续上传的真实装机异常及其他故障材料迭代诊断链路。
+3. **质量与可观测性** —— 保留单元测试和静态检查，并记录分类、检索、模型和工具阶段指标。
 
 ## 版本
 

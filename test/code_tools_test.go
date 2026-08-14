@@ -80,6 +80,19 @@ func TestCodeToolsAreStructuredReadOnlyAndUseSafeIndex(t *testing.T) {
 		if decoded["data_source"] != "local_repository" || decoded["snapshot"] == nil {
 			t.Errorf("%s output=%s", name, output)
 		}
+		if name == projecttools.ToolGetRepositoryRevision {
+			snapshot := decoded["snapshot"].(map[string]any)
+			if snapshot["git_commit"] == "" || snapshot["current_git_commit"] != snapshot["git_commit"] ||
+				snapshot["stale"] != false {
+				t.Fatalf("revision snapshot=%#v", snapshot)
+			}
+			if _, exists := snapshot["stale_reasons"]; exists {
+				t.Fatalf("fresh revision should omit stale_reasons: %#v", snapshot)
+			}
+			if _, exists := snapshot["stale_paths"]; exists {
+				t.Fatalf("fresh revision should omit stale_paths: %#v", snapshot)
+			}
+		}
 	}
 
 	if _, err := names[projecttools.ToolReadFile].InvokableRun(

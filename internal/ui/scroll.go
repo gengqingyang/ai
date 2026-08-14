@@ -91,16 +91,20 @@ func renderedLines(text string) []string {
 	return strings.Split(strings.TrimSuffix(text, "\n"), "\n")
 }
 
-func (m Model) currentScrollViewport() (scrollViewport, int) {
+func (m Model) currentScrollViewport() scrollViewport {
 	width := max(1, m.viewWidth())
 	headerHeight := lineCount(m.renderHeader(width))
 	footerHeight := lineCount(m.renderFooter(width))
 	bodyHeight := max(0, m.height-headerHeight-footerHeight)
-	return m.newScrollViewport(width, bodyHeight), headerHeight
+	return m.newScrollViewport(width, bodyHeight)
+}
+
+func (m Model) scrollBodyTop() int {
+	return lineCount(m.renderHeader(max(1, m.viewWidth())))
 }
 
 func (m *Model) clampScrollOffset() {
-	viewport, _ := m.currentScrollViewport()
+	viewport := m.currentScrollViewport()
 	m.scrollOffset = min(max(0, m.scrollOffset), viewport.maxOffset)
 	if !viewport.showBar {
 		m.scrollDragging = false
@@ -108,23 +112,23 @@ func (m *Model) clampScrollOffset() {
 }
 
 func (m *Model) scrollBy(lines int) {
-	viewport, _ := m.currentScrollViewport()
+	viewport := m.currentScrollViewport()
 	m.scrollOffset = min(max(0, m.scrollOffset+lines), viewport.maxOffset)
 }
 
 func (m Model) scrollPageSize() int {
-	viewport, _ := m.currentScrollViewport()
+	viewport := m.currentScrollViewport()
 	return max(1, viewport.height/2)
 }
 
 func (m *Model) updateScrollMouse(msg tea.MouseMsg) bool {
-	viewport, bodyTop := m.currentScrollViewport()
+	viewport := m.currentScrollViewport()
 	if !viewport.showBar {
 		m.scrollDragging = false
 		return false
 	}
 
-	row := msg.Y - bodyTop
+	row := msg.Y - m.scrollBodyTop()
 	inBody := row >= 0 && row < viewport.height
 	switch msg.Button {
 	case tea.MouseButtonWheelUp:

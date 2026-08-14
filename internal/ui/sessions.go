@@ -43,6 +43,7 @@ func (m Model) updateSessions(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if err != nil {
 			m.appendEntry(roleError, err.Error())
 		} else {
+			m.resetHistoryNavigation()
 			m.transcript = nil
 			m.appendEntry(roleStatus, fmt.Sprintf("已新建并切换到会话：%s [%s]", info.Name, info.ShortID()))
 		}
@@ -59,6 +60,7 @@ func (m *Model) switchSession(query string) {
 		m.appendEntry(roleError, err.Error())
 		return
 	}
+	m.resetHistoryNavigation()
 	messages, tokens := m.app.CurrentSessionStats()
 	m.transcript = nil
 	m.appendEntry(roleStatus, fmt.Sprintf("已切换到会话：%s [%s]，%d 条消息，约 %d tokens",

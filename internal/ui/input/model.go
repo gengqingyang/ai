@@ -29,13 +29,14 @@ type layout struct {
 
 // Model 按 rune 编辑单行输入，避免 UTF-8 中文被按字节删除。
 type Model struct {
-	value    []rune
-	cursor   int
-	maxBytes int
-	prompt   string
-	width    int
-	done     bool
-	err      error
+	value      []rune
+	cursor     int
+	maxBytes   int
+	prompt     string
+	width      int
+	done       bool
+	err        error
+	hideCursor bool
 }
 
 // New 创建输入框。
@@ -109,6 +110,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) View() string {
+	if m.hideCursor {
+		return m.renderCompleted()
+	}
 	if m.done {
 		if m.err != nil {
 			return ""
@@ -150,6 +154,22 @@ func (m Model) Err() error    { return m.err }
 // WithPrompt 返回使用指定提示词的输入框副本。
 func (m Model) WithPrompt(prompt string) Model {
 	m.prompt = prompt
+	return m
+}
+
+// WithValue 返回内容替换为 value 的输入框副本，并将光标移到末尾。
+func (m Model) WithValue(value string) Model {
+	m.value = nil
+	m.cursor = 0
+	m.done = false
+	m.err = nil
+	m.insert([]rune(value))
+	return m
+}
+
+// WithoutCursor 返回隐藏光标的输入框副本，用于展示不可编辑的忙碌状态。
+func (m Model) WithoutCursor() Model {
+	m.hideCursor = true
 	return m
 }
 

@@ -133,16 +133,36 @@ func (g *Gate) Wrap(ctx context.Context, t tool.InvokableTool) (*GatedTool, erro
 // 回放的是提案里存的原始参数，不做任何二次加工——审核人看到的和实际执行的
 // 必须是同一个东西。
 func (g *Gate) Execute(ctx context.Context, id, decider string) (*approval.Proposal, error) {
-	p, err := g.store.Approve(id, decider)
+	p, ok := g.store.Get(id)
+	if !ok {
+		return nil, fmt.Errorf("提案 %s 不存在", id)
+	}
+	var err error
+	switch p.Status {
+	case approval.StatusPending:
+		p, err = g.store.Approve(id, decider)
+		if err != nil {
+			return nil, err
+		}
+	case approval.StatusApproved:
+		// 批准已经持久化但进程尚未取得执行权时，可在重启后继续。审核人和
+		// 原始参数均从 Store 读取，不接受恢复调用修改。
+	case approval.StatusRejected, approval.StatusExecuting, approval.StatusExecuted,
+		approval.StatusFailed, approval.StatusUnknown:
+		return nil, fmt.Errorf("提案 %s 当前状态为 %s，不能执行", id, p.Status)
+	default:
+		return nil, fmt.Errorf("提案 %s 当前状态 %q 无效", id, p.Status)
+	}
+	p, err = g.store.ClaimExecution(id)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("抢占提案 %s 执行权失败: %w", id, err)
 	}
 
 	g.mu.RLock()
 	inner, ok := g.inner[p.Tool]
 	g.mu.RUnlock()
 	if !ok {
-		// 批准了却找不到实现，属于装配错误。标成失败，别把提案留在已批准状态。
+		// 已抢占却找不到实现，属于装配错误。标成确定失败，不能回退为 approved。
 		execErr := fmt.Errorf("工具 %q 未在闸门注册，无法执行", p.Tool)
 		if _, mErr := g.store.MarkExecuted(id, "", execErr); mErr != nil {
 			return nil, fmt.Errorf("%w（且状态回写失败: %v）", execErr, mErr)
@@ -150,11 +170,32 @@ func (g *Gate) Execute(ctx context.Context, id, decider string) (*approval.Propo
 		return nil, execErr
 	}
 
-	slog.Info("执行已批准的操作", "proposal", p.ID, "tool", p.Tool, "decider", decider, "args", p.Args)
+	slog.Info("执行已批准的操作", "proposal", p.ID, "tool", p.Tool, "decider", p.Decider, "args", p.Args)
 	result, runErr := g.run(ctx, inner, p.Args)
-	done, err := g.store.MarkExecuted(id, result, runErr)
+	var done *approval.Proposal
+	if errors.Is(runErr, ErrToolTimeout) || errors.Is(runErr, context.Canceled) ||
+		errors.Is(runErr, context.DeadlineExceeded) {
+		done, err = g.store.MarkUnknown(id, result, runErr)
+	} else {
+		done, err = g.store.MarkExecuted(id, result, runErr)
+	}
 	if err != nil {
-		return nil, err
+		// 工具已经取得执行权并完成了调用，此时不能把状态回写失败伪装成普通
+		// 调用失败。持久化状态仍停在 executing，当前进程和重启恢复都会阻止重试。
+		current, ok := g.store.Get(id)
+		if !ok {
+			current = p
+		}
+		current.Status = approval.StatusUnknown
+		current.Result = result
+		current.Error = fmt.Sprintf("命令已经下发，但最终状态持久化失败；结果按未知处理，禁止自动重试：%v", err)
+		finishedAt := time.Now()
+		current.FinishedAt = &finishedAt
+		slog.Error("执行结果状态回写失败", "proposal", id, "run_error", runErr, "err", err)
+		if n, ok := g.approver.(Noticer); ok {
+			n.Notice(current)
+		}
+		return current, errors.New(current.Error)
 	}
 	slog.Info("操作执行完毕", "proposal", done.ID, "status", string(done.Status), "error", done.Error)
 	// 给审核人一个回执：批完之后终端不能一直静着，尤其是失败和超时。
@@ -171,7 +212,8 @@ func (g *Gate) Execute(ctx context.Context, id, decider string) (*approval.Propo
 // 超时的说法是「不知道跑没跑成」，而不是「没跑」。
 func (g *Gate) run(ctx context.Context, inner tool.InvokableTool, args string) (string, error) {
 	if g.timeout <= 0 {
-		return inner.InvokableRun(ctx, args)
+		result, err := inner.InvokableRun(ctx, args)
+		return result, DescribeRunError(err, 0)
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, g.timeout)
@@ -204,6 +246,9 @@ func DescribeRunError(err error, timeout time.Duration) error {
 	case err == nil:
 		return nil
 	case errors.Is(err, context.DeadlineExceeded):
+		if timeout <= 0 {
+			return fmt.Errorf("%w：调用上下文期限已到，命令可能已经生效，请核实结果", ErrToolTimeout)
+		}
 		return fmt.Errorf("%w：等了 %s 仍未返回，命令可能还在节点上跑，请稍后自行核实结果", ErrToolTimeout, timeout)
 	case errors.Is(err, context.Canceled):
 		return fmt.Errorf("调用被取消（Ctrl-C 或会话结束）: %w", err)
@@ -259,8 +304,8 @@ func (t *GatedTool) Info(context.Context) (*schema.ToolInfo, error) {
 
 // gateResponse 是模型拿到的返回结构。
 //
-// 三种可能：executed（人批了、真跑了）、rejected（人否了）、
-// pending_approval（异步模式，还没人看）。模型必须按字面意思理解，
+// 五种主要结果：executed（人批了、真跑了）、failed（确定失败）、
+// unknown（可能已生效）、rejected（人否了）和 pending_approval（异步待审）。模型必须按字面意思理解，
 // 不能把「已提交」当成「已完成」。
 type gateResponse struct {
 	Status     string `json:"status"`
@@ -285,7 +330,10 @@ func (r gateResponse) marshal() (string, error) {
 // 这个方法是模型唯一能碰到的入口，它自己没有任何执行路径：真正的调用发生在
 // Gate.Execute 里，而 Execute 只有在 Store.Approve 成功之后才会走到工具。
 func (t *GatedTool) InvokableRun(ctx context.Context, argumentsInJSON string, _ ...tool.Option) (string, error) {
-	p := t.gate.store.Create(t.info.Name, argumentsInJSON)
+	p, err := t.gate.store.Create(t.info.Name, argumentsInJSON)
+	if err != nil {
+		return "", fmt.Errorf("创建变更提案失败，操作未执行: %w", err)
+	}
 	risk := AssessRisk(p.Tool, p.Args)
 	slog.Info("模型发起变更操作，待人工确认",
 		"proposal", p.ID, "tool", p.Tool, "risk", risk.Level.String(), "args", p.Args)
@@ -336,7 +384,7 @@ func (t *GatedTool) InvokableRun(ctx context.Context, argumentsInJSON string, _ 
 	}
 
 	done, err := t.gate.Execute(ctx, p.ID, deciderOr(d.Decider))
-	if err != nil {
+	if err != nil && (done == nil || done.Status != approval.StatusUnknown) {
 		return "", fmt.Errorf("执行提案 %s 失败: %w", p.ID, err)
 	}
 
@@ -347,9 +395,12 @@ func (t *GatedTool) InvokableRun(ctx context.Context, argumentsInJSON string, _ 
 		Result:     done.Result,
 		Error:      done.Error,
 	}
-	if done.Status == approval.StatusFailed {
+	if done.Status == approval.StatusUnknown {
+		resp.Message = "人工已批准并已下发，但最终结果未知。命令可能已经生效；" +
+			"请如实告知用户并通过只读证据核实，禁止自动重试同一提案。"
+	} else if done.Status == approval.StatusFailed {
 		resp.Message = "人工已批准，但执行失败。请依据下面的 error 判断原因，不要臆造输出内容；" +
-			"如果是调用超时，说明结果未知（命令可能已经生效），要如实告诉用户，不要直接重试同一条命令。"
+			"不要把确定失败说成成功。"
 	} else {
 		resp.Message = "人工已批准并执行完毕，下面 result 是设备返回的真实输出。请据此继续分析。"
 	}

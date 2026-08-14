@@ -51,11 +51,18 @@ func Run() error {
 	tools.Tunnel.SetOperator(cfg.Operator)
 
 	var storeOptions []approval.Option
+	if cfg.ApprovalFile != "" {
+		storeOptions = append(storeOptions, approval.WithStateFile(cfg.ApprovalFile))
+	}
 	if cfg.AuditLog != "" {
 		storeOptions = append(storeOptions, approval.WithAuditLog(cfg.AuditLog))
 	}
+	proposalStore, err := approval.OpenStore(storeOptions...)
+	if err != nil {
+		return fmt.Errorf("打开提案状态存储失败: %w", err)
+	}
 	gate := tools.NewGate(
-		approval.NewStore(storeOptions...),
+		proposalStore,
 		tools.WithApprover(approver),
 		tools.WithTimeout(cfg.ToolTimeout),
 	)

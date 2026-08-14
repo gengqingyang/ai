@@ -85,5 +85,9 @@ func (m *Model) handleExecutionNotice(proposal *approval.Proposal) {
 		m.appendEntry(roleError, "执行失败："+proposal.Error)
 		return
 	}
+	if proposal.Status == approval.StatusUnknown {
+		m.appendEntry(roleError, "执行结果未知："+proposal.Error+"；请核实实际状态，禁止自动重试。")
+		return
+	}
 	m.appendEntry(roleStatus, "执行完毕，输出已回传给模型。")
 }

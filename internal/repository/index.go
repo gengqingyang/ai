@@ -35,17 +35,17 @@ type indexedFile struct {
 }
 
 type index struct {
-	indexedAt   time.Time
-	files       map[string]*indexedFile
-	directories map[string]int64
-	paths       []string
-	symbols     []Symbol
-	references  []Reference
+	indexedAt    time.Time
+	files        map[string]*indexedFile
+	ignoredFiles map[string]struct{}
+	paths        []string
+	symbols      []Symbol
+	references   []Reference
 }
 
-func buildIndex(ctx context.Context, root string, previous *index) (*index, error) {
+func buildIndex(ctx context.Context, root string, previous *index, ignoredFiles map[string]struct{}) (*index, error) {
 	idx := &index{
-		indexedAt: time.Now(), files: make(map[string]*indexedFile), directories: make(map[string]int64),
+		indexedAt: time.Now(), files: make(map[string]*indexedFile), ignoredFiles: ignoredFiles,
 	}
 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -60,9 +60,6 @@ func buildIndex(ctx context.Context, root string, previous *index) (*index, erro
 		}
 		rel = filepath.ToSlash(rel)
 		if rel == "." {
-			if stat, statErr := entry.Info(); statErr == nil {
-				idx.directories[rel] = stat.ModTime().UnixNano()
-			}
 			return nil
 		}
 		if entry.Type()&os.ModeSymlink != 0 {
@@ -75,14 +72,9 @@ func buildIndex(ctx context.Context, root string, previous *index) (*index, erro
 			if excludedDir(entry.Name()) {
 				return filepath.SkipDir
 			}
-			stat, statErr := entry.Info()
-			if statErr != nil {
-				return statErr
-			}
-			idx.directories[rel] = stat.ModTime().UnixNano()
 			return nil
 		}
-		if excludedFile(rel) {
+		if excludedFile(rel) || ignoredFile(rel, ignoredFiles) {
 			return nil
 		}
 		stat, err := entry.Info()
@@ -328,7 +320,7 @@ func (m *Manager) ListFiles(ctx context.Context, prefix string, limit int) (Snap
 			break
 		}
 	}
-	return m.snapshot(info, idx), files, nil
+	return m.snapshot(ctx, info, idx), files, nil
 }
 
 func (m *Manager) Search(ctx context.Context, query, prefix string, caseSensitive bool, limit int) (Snapshot, []SearchMatch, error) {
@@ -362,12 +354,12 @@ func (m *Manager) Search(ctx context.Context, query, prefix string, caseSensitiv
 			if strings.Contains(haystack, needle) {
 				result = append(result, SearchMatch{Path: path, Line: lineNo + 1, Text: truncateLine(line, 800)})
 				if len(result) == limit {
-					return m.snapshot(info, idx), result, nil
+					return m.snapshot(ctx, info, idx), result, nil
 				}
 			}
 		}
 	}
-	return m.snapshot(info, idx), result, nil
+	return m.snapshot(ctx, info, idx), result, nil
 }
 
 // Grep 使用 Go 正则表达式在安全索引内逐行搜索，供 Eino filesystem.Backend 使用。
@@ -401,12 +393,12 @@ func (m *Manager) Grep(ctx context.Context, pattern, prefix string, caseInsensit
 			if expression.MatchString(line) {
 				result = append(result, SearchMatch{Path: filePath, Line: lineNo + 1, Text: truncateLine(line, 800)})
 				if len(result) == limit {
-					return m.snapshot(info, idx), result, nil
+					return m.snapshot(ctx, info, idx), result, nil
 				}
 			}
 		}
 	}
-	return m.snapshot(info, idx), result, nil
+	return m.snapshot(ctx, info, idx), result, nil
 }
 
 func (m *Manager) ReadFile(ctx context.Context, path string, startLine, endLine int) (Snapshot, []SourceLine, error) {
@@ -430,7 +422,7 @@ func (m *Manager) ReadFile(ctx context.Context, path string, startLine, endLine 
 	for line := startLine; line <= endLine; line++ {
 		lines = append(lines, SourceLine{Line: line, Text: truncateLine(doc.lines[line-1], 4000)})
 	}
-	return m.snapshot(info, idx), lines, nil
+	return m.snapshot(ctx, info, idx), lines, nil
 }
 
 func (m *Manager) FindSymbols(ctx context.Context, name string, limit int) (Snapshot, []Symbol, error) {
@@ -452,7 +444,7 @@ func (m *Manager) FindSymbols(ctx context.Context, name string, limit int) (Snap
 			}
 		}
 	}
-	return m.snapshot(info, idx), result, nil
+	return m.snapshot(ctx, info, idx), result, nil
 }
 
 func (m *Manager) FindReferences(ctx context.Context, name string, callsOnly bool, limit int) (Snapshot, []Reference, error) {
@@ -478,7 +470,7 @@ func (m *Manager) FindReferences(ctx context.Context, name string, callsOnly boo
 			break
 		}
 	}
-	return m.snapshot(info, idx), result, nil
+	return m.snapshot(ctx, info, idx), result, nil
 }
 
 func (m *Manager) Definitions(ctx context.Context, name string, contextLines, limit int) (Snapshot, []Definition, error) {
@@ -518,33 +510,122 @@ func (m *Manager) Revision(ctx context.Context) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, err
 	}
-	return m.snapshot(info, idx), nil
+	return m.snapshot(ctx, info, idx), nil
 }
 
-func indexFilesChanged(root string, idx *index) bool {
-	for path, modTime := range idx.directories {
-		absolute := root
-		if path != "." {
-			absolute = filepath.Join(root, filepath.FromSlash(path))
+func indexFileChanges(ctx context.Context, root string, idx *index) ([]StaleReason, []string) {
+	reasons := make(map[StaleReason]struct{})
+	paths := make(map[string]struct{})
+	seen := make(map[string]struct{}, len(idx.files))
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
-		stat, err := os.Lstat(absolute)
-		if err != nil || !stat.IsDir() || stat.ModTime().UnixNano() != modTime {
-			return true
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		if rel == "." {
+			return nil
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if entry.IsDir() {
+			if excludedDir(entry.Name()) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if excludedFile(rel) || ignoredFile(rel, idx.ignoredFiles) {
+			return nil
+		}
+		stat, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !stat.Mode().IsRegular() || stat.Size() > maxIndexedFileBytes {
+			return nil
+		}
+		if old := idx.files[rel]; old != nil {
+			seen[rel] = struct{}{}
+			if stat.Size() != old.info.Bytes || stat.ModTime().UnixNano() != old.modTimeNS {
+				reasons[StaleSourceFileChanged] = struct{}{}
+				paths[rel] = struct{}{}
+			}
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if isTextFile(rel, data) {
+			reasons[StaleSourceFileAdded] = struct{}{}
+			paths[rel] = struct{}{}
+		}
+		return nil
+	})
+	if err != nil {
+		reasons[StaleRepositoryScanFailed] = struct{}{}
+	} else {
+		for path := range idx.files {
+			if _, ok := seen[path]; !ok {
+				reasons[StaleSourceFileRemoved] = struct{}{}
+				paths[path] = struct{}{}
+			}
 		}
 	}
-	for path, doc := range idx.files {
-		stat, err := os.Lstat(filepath.Join(root, filepath.FromSlash(path)))
-		if err != nil || !stat.Mode().IsRegular() || stat.Size() != doc.info.Bytes ||
-			stat.ModTime().UnixNano() != doc.modTimeNS {
+	changedPaths := make([]string, 0, len(paths))
+	for path := range paths {
+		changedPaths = append(changedPaths, path)
+	}
+	sort.Strings(changedPaths)
+	return orderedStaleReasons(reasons), changedPaths
+}
+
+func ignoredFile(path string, ignored map[string]struct{}) bool {
+	if _, ok := ignored[path]; ok {
+		return true
+	}
+	dir := filepath.ToSlash(filepath.Dir(filepath.FromSlash(path)))
+	base := filepath.Base(filepath.FromSlash(path))
+	for ignoredPath := range ignored {
+		ignoredDir := filepath.ToSlash(filepath.Dir(filepath.FromSlash(ignoredPath)))
+		ignoredBase := filepath.Base(filepath.FromSlash(ignoredPath))
+		if dir == ignoredDir && strings.HasPrefix(base, "."+ignoredBase+".tmp-") {
 			return true
 		}
 	}
 	return false
 }
 
+func orderedStaleReasons(found map[StaleReason]struct{}) []StaleReason {
+	order := []StaleReason{
+		StaleGitCommitChanged,
+		StaleSourceFileAdded,
+		StaleSourceFileChanged,
+		StaleSourceFileRemoved,
+		StaleRepositoryScanFailed,
+	}
+	result := make([]StaleReason, 0, len(found))
+	for _, reason := range order {
+		if _, ok := found[reason]; ok {
+			result = append(result, reason)
+		}
+	}
+	return result
+}
+
 func excludedDir(name string) bool {
 	switch strings.ToLower(name) {
-	case ".git", ".hg", ".svn", "node_modules", "vendor", "bin", "dist", "build", "target", "coverage", ".cache", "__pycache__":
+	case ".git", ".hg", ".svn", ".chat_history_sessions", "node_modules", "vendor", "bin", "dist", "build", "target", "coverage", ".cache", "__pycache__":
 		return true
 	default:
 		return false
@@ -556,6 +637,9 @@ func excludedFile(path string) bool {
 	if base == ".env" || strings.HasPrefix(base, ".env.") || strings.HasSuffix(base, ".log") ||
 		base == ".netrc" || base == ".npmrc" || base == ".pypirc" || base == "credentials" ||
 		base == "credentials.json" || strings.HasPrefix(base, ".chat_history") ||
+		base == ".repositories.json" || base == ".approvals.json" ||
+		strings.HasPrefix(base, "..repositories.json.tmp-") ||
+		strings.HasPrefix(base, "..approvals.json.tmp-") ||
 		base == "audit.log" || base == "diagnostic.log" || base == "id_rsa" || base == "id_ed25519" {
 		return true
 	}

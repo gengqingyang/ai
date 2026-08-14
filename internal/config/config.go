@@ -44,6 +44,8 @@ type Config struct {
 	HistoryFile string
 	// RepositoryFile 是本地代码仓库目录元数据文件；不保存源码正文。
 	RepositoryFile string
+	// ApprovalFile 是提案状态文件；保存原始参数、决定、执行权和结果。
+	ApprovalFile string
 	// ImageMaxBytes 是单张本地图片允许读取的最大字节数。
 	ImageMaxBytes int
 	// ImageDetail 是视觉模型处理图片时使用的精度：auto / low / high。
@@ -84,6 +86,7 @@ func Load() (*Config, error) {
 		HistoryTokens:  envInt("AGENT_HISTORY_TOKENS", 900_000),
 		HistoryFile:    envOr("AGENT_HISTORY_FILE", ".chat_history.json"),
 		RepositoryFile: envOr("AGENT_REPOSITORY_FILE", ".repositories.json"),
+		ApprovalFile:   envOr("AGENT_APPROVAL_FILE", ".approvals.json"),
 		ImageMaxBytes:  envInt("AGENT_IMAGE_MAX_BYTES", 20*1024*1024),
 		ImageDetail:    envOr("AGENT_IMAGE_DETAIL", "auto"),
 		AuditLog:       envOr("AUDIT_LOG", "audit.log"),
@@ -171,10 +174,10 @@ func (c *Config) Redacted() string {
 	if c.APIKey == "" {
 		cred = "AuthToken"
 	}
-	return fmt.Sprintf("provider=%s model=%s endpoint=%s cred=%s context=%d maxOutput=%d historyTokens=%d imageMax=%dMB imageDetail=%s maxStep=%d skills=%s toolTimeout=%s operator=%s history=%s repositories=%s audit=%s log=%s(%s)",
+	return fmt.Sprintf("provider=%s model=%s endpoint=%s cred=%s context=%d maxOutput=%d historyTokens=%d imageMax=%dMB imageDetail=%s maxStep=%d skills=%s toolTimeout=%s operator=%s history=%s repositories=%s approvals=%s audit=%s log=%s(%s)",
 		c.Provider, c.Model, base, cred, c.ContextTokens, c.MaxTokens, c.HistoryTokens,
 		c.ImageMaxBytes/(1024*1024), c.ImageDetail, c.MaxStep, pathDesc(c.SkillsDir), c.ToolTimeout, c.Operator,
-		pathDesc(c.HistoryFile), pathDesc(c.RepositoryFile), pathDesc(c.AuditLog), pathDesc(c.LogFile), c.LogLevel)
+		pathDesc(c.HistoryFile), pathDesc(c.RepositoryFile), pathDesc(c.ApprovalFile), pathDesc(c.AuditLog), pathDesc(c.LogFile), c.LogLevel)
 }
 
 func pathDesc(path string) string {

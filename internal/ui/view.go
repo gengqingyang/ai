@@ -30,7 +30,9 @@ func (m Model) renderHeader(width int) string {
 		sessionText = fmt.Sprintf("会话 %s [%s]", info.Name, info.ShortID())
 	}
 	state := "就绪"
-	if m.mode == modeBusy {
+	if m.copyMode {
+		state = "复制模式"
+	} else if m.mode == modeBusy {
 		state = "处理中"
 	} else if m.mode == modeApproval || m.mode == modeRejectReason {
 		state = "等待人工审核"
@@ -48,7 +50,7 @@ func (m Model) renderBody(width int) string {
 		body.WriteString(renderEntry(entry, width))
 	}
 	if m.streaming != "" {
-		body.WriteString(renderEntry(transcriptEntry{role: roleAssistant, content: m.streaming}, width))
+		body.WriteString(renderEntry(transcriptEntry{role: m.streamRole, content: m.streaming}, width))
 	}
 	switch m.mode {
 	case modeApproval:
@@ -65,18 +67,39 @@ func (m Model) renderFooter(width int) string {
 	rule := metaStyle.Render(strings.Repeat("─", max(1, width))) + "\n"
 	switch m.mode {
 	case modeInput:
+		hint := "Enter 发送 · ↑/↓ 历史输入 · 滚轮/PgUp/PgDn 滚动 · F2 复制模式 · Ctrl-C 退出"
+		if m.copyMode {
+			hint = "复制模式：鼠标拖选文字 · Cmd-C 复制 · F2/Esc 返回"
+		}
 		return rule + m.input.View() + "\n" + metaStyle.Render(menu.TruncateCells(
-			"Enter 发送 · 滚轮/PgUp/PgDn 滚动 · /help 命令 · Ctrl-C 退出", width)) + "\n"
+			hint, width)) + "\n"
 	case modeBusy:
-		return rule + statusStyle.Render(menu.TruncateCells(
-			"正在处理，请稍候 · Ctrl-C 取消并退出", width)) + "\n"
+		hint := "请求执行中 · 滚轮/PgUp/PgDn 滚动 · F2 复制模式 · Ctrl-C 取消并退出"
+		if m.copyMode {
+			hint = "复制模式：鼠标拖选文字 · Cmd-C 复制 · F2/Esc 返回"
+		}
+		return rule + m.input.WithPrompt("› 正在处理，请稍候 ").WithoutCursor().View() + "\n" +
+			statusStyle.Render(menu.TruncateCells(
+				hint, width)) + "\n"
 	case modeApproval:
-		return rule + statusStyle.Render(menu.TruncateCells("请核对命令原文后明确选择", width)) + "\n"
+		hint := "请核对命令原文后明确选择 · F2 复制模式"
+		if m.copyMode {
+			hint = "复制模式：鼠标拖选文字 · Cmd-C 复制 · F2/Esc 返回"
+		}
+		return rule + statusStyle.Render(menu.TruncateCells(hint, width)) + "\n"
 	case modeRejectReason:
+		hint := "Enter 提交理由 · Esc 不填写理由 · F2 复制模式"
+		if m.copyMode {
+			hint = "复制模式：鼠标拖选文字 · Cmd-C 复制 · F2/Esc 返回"
+		}
 		return rule + m.input.View() + "\n" + metaStyle.Render(menu.TruncateCells(
-			"Enter 提交理由 · Esc 不填写理由", width)) + "\n"
+			hint, width)) + "\n"
 	case modeSessions:
-		return rule + metaStyle.Render(menu.TruncateCells("Esc 返回", width)) + "\n"
+		hint := "Esc 返回 · F2 复制模式"
+		if m.copyMode {
+			hint = "复制模式：鼠标拖选文字 · Cmd-C 复制 · F2/Esc 返回"
+		}
+		return rule + metaStyle.Render(menu.TruncateCells(hint, width)) + "\n"
 	default:
 		return rule
 	}
@@ -117,6 +140,10 @@ func entryLabel(role transcriptRole) (string, lipgloss.Style) {
 		return "你 >", userStyle
 	case roleAssistant:
 		return "助手 >", agentStyle
+	case roleReasoning:
+		return "思考 >", reasoningStyle
+	case roleProgress:
+		return "过程 >", progressStyle
 	case roleIntent:
 		return "意图 >", intentStyle
 	case roleError:

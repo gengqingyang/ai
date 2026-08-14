@@ -306,7 +306,7 @@ func NewCodeTools(manager *repository.Manager) ([]tool.BaseTool, error) {
 
 	getRevision, err := utils.InferTool(
 		ToolGetRepositoryRevision,
-		"返回当前代码仓库建立索引时的 Git commit、分支、索引版本和是否因 commit 变化而过期；不执行 Git 命令。",
+		"返回当前代码仓库的索引 commit、当前 commit、分支、索引版本、明确的过期原因和相关文件路径；不执行 Git 命令。只有 stale_reasons 包含 git_commit_changed 才表示提交变化，source_file_* 表示 stale_paths 中的工作区文件在索引后发生变化。",
 		func(ctx context.Context, _ revisionInput) (revisionOutput, error) {
 			snapshot, err := manager.Revision(ctx)
 			if err != nil {

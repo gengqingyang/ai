@@ -59,6 +59,7 @@ func (m Model) submit(line string) (tea.Model, tea.Cmd) {
 		if err != nil {
 			m.appendEntry(roleError, err.Error())
 		} else {
+			m.resetHistoryNavigation()
 			m.transcript = nil
 			m.appendEntry(roleStatus, fmt.Sprintf("已新建并切换到会话：%s [%s]", info.Name, info.ShortID()))
 		}
@@ -91,16 +92,24 @@ func (m Model) submit(line string) (tea.Model, tea.Cmd) {
 func (m Model) beginAsk(msg *schema.Message, display string) (tea.Model, tea.Cmd) {
 	m.appendEntry(roleUser, display)
 	m.streaming = ""
+	m.streamRole = roleAssistant
+	m.assistantStreamed = false
 	m.mode = modeBusy
 	requestCtx, cancel := context.WithCancel(m.ctx)
 	m.requestCancel = cancel
 
 	cmd := func() tea.Msg {
-		reply, err := m.app.AskMessage(
+		reply, err := m.app.AskMessageWithProgress(
 			requestCtx,
 			msg,
 			func(result intent.Result) {
 				sendEvent(requestCtx, m.events, intentMsg{result: result})
+			},
+			func(progress string) {
+				sendEvent(requestCtx, m.events, agentProgressMsg{text: progress})
+			},
+			func(chunk string) {
+				sendEvent(requestCtx, m.events, reasoningChunkMsg{chunk: chunk})
 			},
 			func(chunk string) {
 				sendEvent(requestCtx, m.events, assistantChunkMsg{chunk: chunk})
@@ -125,19 +134,19 @@ func (m *Model) finishAsk(done askDoneMsg) {
 		m.approval.result <- approvalResult{err: ErrNoApproval}
 		m.approval = nil
 	}
-	if strings.TrimSpace(m.streaming) != "" {
-		m.appendEntry(roleAssistant, m.streaming)
-	} else if done.err == nil && done.reply != "" {
+	m.flushStreaming()
+	if !m.assistantStreamed && done.err == nil && done.reply != "" {
 		m.appendEntry(roleAssistant, done.reply)
-	} else if done.err == nil {
+	} else if !m.assistantStreamed && done.err == nil {
 		m.appendEntry(roleStatus, "模型没有再补充说明。")
 	}
 	if done.err != nil {
 		m.appendEntry(roleError, "本轮失败: "+humanErr(done.err))
 	}
-	m.streaming = ""
+	m.assistantStreamed = false
 	m.mode = modeInput
 	m.input = uiinput.New(m.inputMaxBytes)
+	m.resetHistoryNavigation()
 	m.resizeInput()
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -107,6 +108,9 @@ func TestRepositoryExcludesSecretsBinaryLogsGeneratedAndSymlinks(t *testing.T) {
 	}
 	writeTestFile(t, filepath.Join(root, ".env"), "TOKEN=secret\n")
 	writeTestFile(t, filepath.Join(root, "diagnostic.log"), "secret log\n")
+	writeTestFile(t, filepath.Join(root, ".repositories.json"), "repository state\n")
+	writeTestFile(t, filepath.Join(root, ".approvals.json"), "approval state\n")
+	writeTestFile(t, filepath.Join(root, ".chat_history_sessions", "private.json"), "private chat\n")
 	writeTestFile(t, filepath.Join(root, "private.txt"), "-----BEGIN PRIVATE KEY-----\nsecret\n")
 	writeTestFile(t, filepath.Join(root, "blob.bin"), string([]byte{0, 1, 2, 3}))
 	writeTestFile(t, filepath.Join(root, "node_modules", "generated.js"), "generated\n")
@@ -127,7 +131,10 @@ func TestRepositoryExcludesSecretsBinaryLogsGeneratedAndSymlinks(t *testing.T) {
 		paths = append(paths, file.Path)
 	}
 	joined := strings.Join(paths, "\n")
-	for _, excluded := range []string{".env", "diagnostic.log", "private.txt", "blob.bin", "generated.js", "outside-link.txt"} {
+	for _, excluded := range []string{
+		".env", "diagnostic.log", ".repositories.json", ".approvals.json", "private.json",
+		"private.txt", "blob.bin", "generated.js", "outside-link.txt",
+	} {
 		if strings.Contains(joined, excluded) {
 			t.Errorf("安全索引包含了 %q: %v", excluded, paths)
 		}
@@ -184,8 +191,20 @@ func TestRepositoryPersistsCatalogReindexesAndDetectsRevisionChange(t *testing.T
 	if !changedSnapshot.Stale {
 		t.Fatal("未提交源码发生变化后 snapshot.stale=false")
 	}
+	if changedSnapshot.CurrentGitCommit != changedSnapshot.GitCommit ||
+		!reflect.DeepEqual(changedSnapshot.StaleReasons, []repository.StaleReason{repository.StaleSourceFileChanged}) ||
+		!reflect.DeepEqual(changedSnapshot.StalePaths, []string{"internal/install.go"}) {
+		t.Fatalf("源码变化原因不准确: %#v", changedSnapshot)
+	}
 	if _, err := reopened.Reindex(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+	freshSnapshot, err := reopened.Revision(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if freshSnapshot.Stale || len(freshSnapshot.StaleReasons) != 0 {
+		t.Fatalf("重索引后仍过期: %#v", freshSnapshot)
 	}
 	if _, symbols, err := reopened.FindSymbols(context.Background(), "RetryInstall", 20); err != nil || len(symbols) != 1 {
 		t.Fatalf("reindexed symbols=%#v err=%v", symbols, err)
@@ -196,8 +215,96 @@ func TestRepositoryPersistsCatalogReindexesAndDetectsRevisionChange(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !snapshot.Stale || snapshot.GitCommit != strings.Repeat("a", 40) {
+	if !snapshot.Stale || snapshot.GitCommit != strings.Repeat("a", 40) ||
+		snapshot.CurrentGitCommit != strings.Repeat("b", 40) ||
+		!reflect.DeepEqual(snapshot.StaleReasons, []repository.StaleReason{repository.StaleGitCommitChanged}) {
 		t.Fatalf("revision snapshot = %#v", snapshot)
+	}
+}
+
+func TestRepositoryCatalogInsideRootDoesNotInvalidateOwnIndex(t *testing.T) {
+	root := makeCodeRepository(t)
+	statePath := filepath.Join(root, "catalog-state.json")
+	manager, err := repository.Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Add(context.Background(), root, "source"); err != nil {
+		t.Fatal(err)
+	}
+
+	assertFresh := func(stage string) {
+		t.Helper()
+		snapshot, err := manager.Revision(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if snapshot.Stale || len(snapshot.StaleReasons) != 0 {
+			t.Fatalf("%s 后索引过期: %#v", stage, snapshot)
+		}
+	}
+	assertFresh("添加仓库并保存目录")
+
+	tempState := filepath.Join(root, ".catalog-state.json.tmp-interrupted")
+	writeTestFile(t, tempState, "temporary state\n")
+	assertFresh("出现状态临时文件")
+	if err := os.Remove(tempState); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(root, ".repositories.json"), "repository state changed\n")
+	writeTestFile(t, filepath.Join(root, ".approvals.json"), "approval state changed\n")
+	writeTestFile(t, filepath.Join(root, ".chat_history_sessions", "session.json"), "chat state changed\n")
+	assertFresh("本地状态文件变化")
+
+	if _, err := manager.Reindex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	assertFresh("重新索引并保存目录")
+
+	_, files, err := manager.ListFiles(context.Background(), "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range files {
+		if file.Path == "catalog-state.json" || strings.Contains(file.Path, "catalog-state.json.tmp-") {
+			t.Fatalf("仓库状态文件进入安全索引: %#v", file)
+		}
+	}
+}
+
+func TestRepositoryReportsAddedAndRemovedSourceFiles(t *testing.T) {
+	root := makeCodeRepository(t)
+	manager, err := repository.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Add(context.Background(), root, "source"); err != nil {
+		t.Fatal(err)
+	}
+
+	addedPath := filepath.Join(root, "new.go")
+	writeTestFile(t, addedPath, "package source\n")
+	added, err := manager.Revision(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(added.StaleReasons, []repository.StaleReason{repository.StaleSourceFileAdded}) ||
+		!reflect.DeepEqual(added.StalePaths, []string{"new.go"}) {
+		t.Fatalf("新增源码原因=%#v", added)
+	}
+	if _, err := manager.Reindex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(addedPath); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := manager.Revision(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(removed.StaleReasons, []repository.StaleReason{repository.StaleSourceFileRemoved}) ||
+		!reflect.DeepEqual(removed.StalePaths, []string{"new.go"}) {
+		t.Fatalf("删除源码原因=%#v", removed)
 	}
 }
 

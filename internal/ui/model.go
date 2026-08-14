@@ -47,6 +47,8 @@ const (
 	roleSystem    transcriptRole = "system"
 	roleUser      transcriptRole = "user"
 	roleAssistant transcriptRole = "assistant"
+	roleReasoning transcriptRole = "reasoning"
+	roleProgress  transcriptRole = "progress"
 	roleIntent    transcriptRole = "intent"
 	roleError     transcriptRole = "error"
 	roleStatus    transcriptRole = "status"
@@ -71,20 +73,26 @@ type Model struct {
 	app    *chat.App
 	events chan tea.Msg
 
-	mode       mode
-	input      uiinput.Model
-	menu       menu.Model
-	transcript []transcriptEntry
-	streaming  string
-	approval   *approvalRequestMsg
-	sessions   []session.Info
+	mode              mode
+	input             uiinput.Model
+	menu              menu.Model
+	transcript        []transcriptEntry
+	streaming         string
+	streamRole        transcriptRole
+	assistantStreamed bool
+	approval          *approvalRequestMsg
+	sessions          []session.Info
 
 	inputMaxBytes  int
+	inputHistory   map[string][]string
+	historyIndex   int
+	historyDraft   string
 	requestCancel  context.CancelFunc
 	width          int
 	height         int
 	scrollOffset   int
 	scrollDragging bool
+	copyMode       bool
 }
 
 // NewModel 创建根 UI。events 为 nil 时可在测试中手工投递消息。
@@ -103,6 +111,9 @@ func NewModel(ctx context.Context, app *chat.App, events chan tea.Msg, cfg Model
 		mode:          modeInput,
 		input:         uiinput.New(maxBytes),
 		inputMaxBytes: maxBytes,
+		inputHistory:  make(map[string][]string),
+		historyIndex:  -1,
+		streamRole:    roleAssistant,
 	}
 	if strings.TrimSpace(cfg.Banner) != "" {
 		m.appendEntry(roleSystem, cfg.Banner)
@@ -115,6 +126,31 @@ func (m Model) Init() tea.Cmd { return m.waitForEvent() }
 func (m *Model) appendEntry(role transcriptRole, content string) {
 	m.transcript = append(m.transcript, transcriptEntry{role: role, content: content})
 	m.scrollOffset = 0
+}
+
+func (m *Model) appendStreaming(role transcriptRole, chunk string) {
+	if chunk == "" {
+		return
+	}
+	if m.streaming != "" && m.streamRole != role {
+		m.flushStreaming()
+	}
+	if m.streaming == "" && strings.Trim(chunk, "\r\n") == "" {
+		return
+	}
+	if m.streaming == "" {
+		m.streamRole = role
+	}
+	m.streaming += chunk
+	m.scrollOffset = 0
+}
+
+func (m *Model) flushStreaming() {
+	if strings.TrimSpace(m.streaming) != "" {
+		m.appendEntry(m.streamRole, m.streaming)
+	}
+	m.streaming = ""
+	m.streamRole = roleAssistant
 }
 
 func (m *Model) resizeMenu() {
@@ -141,6 +177,9 @@ func (m Model) viewWidth() int {
 // Mode 返回当前 UI 模式，便于黑盒测试和状态诊断。
 func (m Model) Mode() string { return m.mode.String() }
 
+// CopyMode 返回终端原生文字选择是否已启用。
+func (m Model) CopyMode() bool { return m.copyMode }
+
 // InputValue 返回当前输入框内容。
 func (m Model) InputValue() string { return m.input.Value() }
 
@@ -151,7 +190,7 @@ func (m Model) TranscriptText() string {
 		fmt.Fprintf(&out, "%s: %s\n", entry.role, entry.content)
 	}
 	if m.streaming != "" {
-		fmt.Fprintf(&out, "%s: %s\n", roleAssistant, m.streaming)
+		fmt.Fprintf(&out, "%s: %s\n", m.streamRole, m.streaming)
 	}
 	return out.String()
 }

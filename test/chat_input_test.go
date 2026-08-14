@@ -77,6 +77,35 @@ func TestLineInputHonorsUTF8ByteLimit(t *testing.T) {
 	}
 }
 
+func TestLineInputWithValueHonorsUTF8ByteLimitAndResetsState(t *testing.T) {
+	input := uiinput.New(4).WithValue("你ab")
+	if input.Value() != "你a" || input.Cursor() != 2 {
+		t.Fatalf("WithValue 后 value=%q cursor=%d", input.Value(), input.Cursor())
+	}
+
+	input = updateLineInput(t, input, tea.KeyMsg{Type: tea.KeyEnter})
+	input = input.WithValue("好x")
+	if input.Value() != "好x" || input.Cursor() != 2 || input.Done() || input.Err() != nil {
+		t.Fatalf("重置后 value=%q cursor=%d done=%v err=%v",
+			input.Value(), input.Cursor(), input.Done(), input.Err())
+	}
+}
+
+func TestLineInputWithoutCursorKeepsBarAndStatusPrompt(t *testing.T) {
+	const width = 30
+	input := uiinput.New(1024).WithPrompt("› 正在处理，请稍候 ").WithoutCursor()
+	updated, _ := input.Update(tea.WindowSizeMsg{Width: width})
+	view := updated.(uiinput.Model).View()
+	if !strings.Contains(view, "› 正在处理，请稍候 ") {
+		t.Fatalf("忙碌输入栏缺少状态提示：\n%s", view)
+	}
+	for _, line := range strings.Split(view, "\n") {
+		if got := lipgloss.Width(line); got != width {
+			t.Fatalf("忙碌输入栏宽度=%d, want %d: %q", got, width, line)
+		}
+	}
+}
+
 func TestLineInputRendersThreeLineBarAtTerminalWidth(t *testing.T) {
 	const width = 32
 	input := uiinput.New(1024)

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -68,6 +69,26 @@ type fakeMutating struct {
 	runs  atomic.Int32
 	gotIn atomic.Value // string，最后一次收到的参数
 	err   error
+}
+
+type stateBreakingTool struct {
+	path string
+	runs atomic.Int32
+}
+
+func (t *stateBreakingTool) Info(context.Context) (*schema.ToolInfo, error) {
+	return &schema.ToolInfo{Name: "restart_plugin", Desc: "执行后破坏测试状态路径"}, nil
+}
+
+func (t *stateBreakingTool) InvokableRun(context.Context, string, ...tool.Option) (string, error) {
+	t.runs.Add(1)
+	if err := os.Remove(t.path); err != nil {
+		return "", err
+	}
+	if err := os.Mkdir(t.path, 0o700); err != nil {
+		return "", err
+	}
+	return "restarted", nil
 }
 
 func newFakeMutating(name string) *fakeMutating {
@@ -309,6 +330,176 @@ func TestExecuteTwiceRunsOnlyOnce(t *testing.T) {
 	}
 	if got := real.runs.Load(); got != 1 {
 		t.Fatalf("真实工具执行 %d 次, want 1", got)
+	}
+}
+
+func TestConcurrentExecuteRunsRealToolOnce(t *testing.T) {
+	ctx := context.Background()
+	gate, _ := newTestGate()
+	real := newFakeMutating("restart_plugin")
+	gated, _ := gate.Wrap(ctx, real)
+	out, err := gated.InvokableRun(ctx, "{}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp gateResponse
+	if err := json.Unmarshal([]byte(out), &resp); err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for range 2 {
+		go func() {
+			<-start
+			_, err := gate.Execute(ctx, resp.ProposalID, "alice")
+			results <- err
+		}()
+	}
+	close(start)
+	successes := 0
+	for range 2 {
+		if err := <-results; err == nil {
+			successes++
+		}
+	}
+	if successes != 1 || real.runs.Load() != 1 {
+		t.Fatalf("成功 Execute=%d, 真实执行=%d; want 1/1", successes, real.runs.Load())
+	}
+}
+
+func TestGateResumesPersistedApprovedProposal(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "approvals.json")
+	store, err := approval.OpenStore(approval.WithStateFile(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := store.Create("restart_plugin", `{"sn":"SN001","plugin":"cache"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Approve(p.ID, "alice"); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := approval.OpenStore(approval.WithStateFile(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := NewGate(reopened)
+	real := newFakeMutating("restart_plugin")
+	if _, err := gate.Wrap(ctx, real); err != nil {
+		t.Fatal(err)
+	}
+	done, err := gate.Execute(ctx, p.ID, "mallory")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if real.runs.Load() != 1 || real.lastArgs() != p.Args {
+		t.Fatalf("恢复后执行次数=%d args=%q", real.runs.Load(), real.lastArgs())
+	}
+	if done.Decider != "alice" {
+		t.Fatalf("恢复调用覆盖了原审核人: %q", done.Decider)
+	}
+}
+
+func TestGateNeverExecutesRecoveredUnknownProposal(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "approvals.json")
+	store, err := approval.OpenStore(approval.WithStateFile(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := store.Create("restart_plugin", "{}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Approve(p.ID, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimExecution(p.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := approval.OpenStore(approval.WithStateFile(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := NewGate(reopened)
+	real := newFakeMutating("restart_plugin")
+	if _, err := gate.Wrap(ctx, real); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gate.Execute(ctx, p.ID, "alice"); err == nil {
+		t.Fatal("unknown 提案被再次执行")
+	}
+	if real.runs.Load() != 0 {
+		t.Fatalf("unknown 提案真实执行次数=%d", real.runs.Load())
+	}
+}
+
+func TestGatedToolFailsClosedWhenProposalCannotPersist(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "approvals.json")
+	store, err := approval.OpenStore(approval.WithStateFile(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	real := newFakeMutating("restart_plugin")
+	ap := &stubApprover{decision: Decision{Approved: true, Decider: "alice"}}
+	gate := NewGate(store, WithApprover(ap))
+	gated, err := gate.Wrap(ctx, real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gated.InvokableRun(ctx, "{}"); err == nil ||
+		!strings.Contains(err.Error(), "操作未执行") {
+		t.Fatalf("提案落盘失败未显式返回: %v", err)
+	}
+	if ap.calls.Load() != 0 || real.runs.Load() != 0 || len(store.All()) != 0 {
+		t.Fatalf("落盘失败后 approver=%d runs=%d proposals=%d",
+			ap.calls.Load(), real.runs.Load(), len(store.All()))
+	}
+}
+
+func TestGatedToolReportsUnknownWhenOutcomeCannotPersist(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "approvals.json")
+	store, err := approval.OpenStore(approval.WithStateFile(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	real := &stateBreakingTool{path: path}
+	ap := &stubApprover{decision: Decision{Approved: true, Decider: "alice"}}
+	gate := NewGate(store, WithApprover(ap))
+	gated, err := gate.Wrap(ctx, real)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := gated.InvokableRun(ctx, "{}")
+	if err != nil {
+		t.Fatalf("回写失败应作为 unknown 告知模型: %v", err)
+	}
+	var resp gateResponse
+	if err := json.Unmarshal([]byte(out), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Status != string(approval.StatusUnknown) ||
+		!strings.Contains(resp.Error, "持久化失败") ||
+		!strings.Contains(resp.Error, "禁止自动重试") {
+		t.Fatalf("回写失败响应=%#v", resp)
+	}
+	if real.runs.Load() != 1 {
+		t.Fatalf("真实工具执行次数=%d, want 1", real.runs.Load())
+	}
+	p, ok := store.Get(resp.ProposalID)
+	if !ok || p.Status != approval.StatusExecuting {
+		t.Fatalf("回写失败后持久状态=%#v, want executing", p)
 	}
 }
 

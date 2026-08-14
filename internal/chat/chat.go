@@ -20,6 +20,18 @@ type ConversationAgent interface {
 	Stream(context.Context, []*schema.Message, func(intent.Result), func(string)) (string, error)
 }
 
+// ProgressiveConversationAgent 可额外上报 Agent 阶段、工具轨迹和模型提供的思考摘要。
+type ProgressiveConversationAgent interface {
+	StreamWithProgress(
+		context.Context,
+		[]*schema.Message,
+		func(intent.Result),
+		func(string),
+		func(string),
+		func(string),
+	) (string, error)
+}
+
 // App 保存对话、会话和图片业务状态，不持有任何终端对象。
 type App struct {
 	agent         ConversationAgent
@@ -77,6 +89,17 @@ func (a *App) History() []*schema.Message {
 // AskMessage 执行一轮模型调用。
 func (a *App) AskMessage(ctx context.Context, userMessage *schema.Message,
 	onIntent func(intent.Result), onChunk func(string)) (string, error) {
+	return a.askMessage(ctx, userMessage, onIntent, nil, nil, onChunk)
+}
+
+// AskMessageWithProgress 执行一轮模型调用，并在 Agent 支持时转发可展示的执行过程。
+func (a *App) AskMessageWithProgress(ctx context.Context, userMessage *schema.Message,
+	onIntent func(intent.Result), onProgress, onReasoning, onChunk func(string)) (string, error) {
+	return a.askMessage(ctx, userMessage, onIntent, onProgress, onReasoning, onChunk)
+}
+
+func (a *App) askMessage(ctx context.Context, userMessage *schema.Message,
+	onIntent func(intent.Result), onProgress, onReasoning, onChunk func(string)) (string, error) {
 	if a.agent == nil {
 		return "", errors.New("聊天 Agent 未配置")
 	}
@@ -85,7 +108,15 @@ func (a *App) AskMessage(ctx context.Context, userMessage *schema.Message,
 	}
 	slog.Info("用户提问", "chars", len([]rune(userMessage.Content)), "images", messageImageCount(userMessage))
 
-	reply, err := a.agent.Stream(ctx, a.sess.Messages(), onIntent, onChunk)
+	var reply string
+	var err error
+	if progressive, ok := a.agent.(ProgressiveConversationAgent); ok {
+		reply, err = progressive.StreamWithProgress(
+			ctx, a.sess.Messages(), onIntent, onProgress, onReasoning, onChunk,
+		)
+	} else {
+		reply, err = a.agent.Stream(ctx, a.sess.Messages(), onIntent, onChunk)
+	}
 	if err != nil {
 		return reply, err
 	}

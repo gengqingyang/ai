@@ -5,6 +5,17 @@ import "time"
 
 const IndexVersion = 1
 
+// StaleReason 解释安全索引为什么不再对应当前仓库状态。
+type StaleReason string
+
+const (
+	StaleGitCommitChanged     StaleReason = "git_commit_changed"
+	StaleSourceFileAdded      StaleReason = "source_file_added"
+	StaleSourceFileChanged    StaleReason = "source_file_changed"
+	StaleSourceFileRemoved    StaleReason = "source_file_removed"
+	StaleRepositoryScanFailed StaleReason = "repository_scan_failed"
+)
+
 // Info 是仓库目录中持久化的稳定元数据。
 type Info struct {
 	Name         string    `json:"name"`
@@ -20,12 +31,15 @@ type Info struct {
 
 // Snapshot 标识一次查询使用的仓库和索引版本。
 type Snapshot struct {
-	Repository   string    `json:"repository"`
-	GitCommit    string    `json:"git_commit,omitempty"`
-	GitBranch    string    `json:"git_branch,omitempty"`
-	IndexVersion int       `json:"index_version"`
-	IndexedAt    time.Time `json:"indexed_at"`
-	Stale        bool      `json:"stale"`
+	Repository       string        `json:"repository"`
+	GitCommit        string        `json:"git_commit,omitempty"`
+	CurrentGitCommit string        `json:"current_git_commit,omitempty"`
+	GitBranch        string        `json:"git_branch,omitempty"`
+	IndexVersion     int           `json:"index_version"`
+	IndexedAt        time.Time     `json:"indexed_at"`
+	Stale            bool          `json:"stale"`
+	StaleReasons     []StaleReason `json:"stale_reasons,omitempty"`
+	StalePaths       []string      `json:"stale_paths,omitempty"`
 }
 
 // FileInfo 是已经通过安全扫描的文件元数据。

@@ -9,6 +9,8 @@ import (
 )
 
 type intentMsg struct{ result intent.Result }
+type agentProgressMsg struct{ text string }
+type reasoningChunkMsg struct{ chunk string }
 type assistantChunkMsg struct{ chunk string }
 type logMsg struct{ line string }
 type askDoneMsg struct {

@@ -15,7 +15,10 @@ import (
 )
 
 func testProposal() (*approval.Proposal, tools.RiskAssessment) {
-	p := approval.NewStore().Create("run_tunnel_cmd", `{"sn":"SN001","cmd":"date","purpose":"查看节点系统时间"}`)
+	p, err := approval.NewStore().Create("run_tunnel_cmd", `{"sn":"SN001","cmd":"date","purpose":"查看节点系统时间"}`)
+	if err != nil {
+		panic(err)
+	}
 	return p, tools.AssessRisk(p.Tool, p.Args)
 }
 
@@ -80,13 +83,19 @@ func TestUIApproverRejectReasonThroughRootModel(t *testing.T) {
 		done <- decision
 	}()
 
-	model := NewModel(ctx, nil, events, ModelConfig{})
+	model := newRootModel(t, events)
+	model = submitRootLine(t, model, "/help")
 	model = updateRoot(t, model, <-events)
 	model = updateRoot(t, model, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
 	if model.Mode() != "rejection_reason" {
 		t.Fatalf("mode = %q, want rejection_reason", model.Mode())
 	}
 	model = updateRoot(t, model, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("线上高峰期")})
+	model = updateRoot(t, model, tea.KeyMsg{Type: tea.KeyUp})
+	model = updateRoot(t, model, tea.KeyMsg{Type: tea.KeyDown})
+	if model.InputValue() != "线上高峰期" {
+		t.Fatalf("拒绝理由输入不应使用主输入历史，value=%q", model.InputValue())
+	}
 	model = updateRoot(t, model, tea.KeyMsg{Type: tea.KeyEnter})
 
 	decision := <-done
@@ -136,9 +145,29 @@ func TestUIApproverNoticeUsesBubbleTeaEvent(t *testing.T) {
 	}
 }
 
+func TestUIApproverNoticeMarksUnknownAsUnsafeToRetry(t *testing.T) {
+	events := make(chan tea.Msg, 1)
+	approver := NewApprover(context.Background(), events, "tester")
+	p, _ := testProposal()
+	p.Status = approval.StatusUnknown
+	p.Error = "调用超时"
+	approver.Notice(p)
+
+	model := NewModel(context.Background(), nil, events, ModelConfig{})
+	model = updateRoot(t, model, <-events)
+	for _, want := range []string{"执行结果未知", "调用超时", "禁止自动重试"} {
+		if !strings.Contains(model.TranscriptText(), want) {
+			t.Fatalf("unknown notice 缺少 %q: %s", want, model.TranscriptText())
+		}
+	}
+}
+
 func TestApprovalCardDoesNotTruncateCommand(t *testing.T) {
 	long := "journalctl -u onething-agent --since '2026-07-30 00:00:00' --no-pager | grep -i error"
-	p := approval.NewStore().Create("run_tunnel_cmd", `{"sn":"SN001","cmd":"`+long+`"}`)
+	p, err := approval.NewStore().Create("run_tunnel_cmd", `{"sn":"SN001","cmd":"`+long+`"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
 	card := ApprovalCard(p, tools.AssessRisk(p.Tool, p.Args))
 	if !strings.Contains(card, long) || !strings.Contains(card, "run_tunnel_cmd") {
 		t.Fatalf("审批卡片信息不完整:\n%s", card)

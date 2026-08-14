@@ -19,10 +19,19 @@ func fixedClock() func() time.Time {
 	return func() time.Time { return t }
 }
 
+func createProposal(t *testing.T, s *Store, tool, args string) *Proposal {
+	t.Helper()
+	p, err := s.Create(tool, args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
 func TestCreateStartsPending(t *testing.T) {
 	s := NewStore(WithClock(fixedClock()))
 
-	p := s.Create("run_tunnel_cmd", `{"sn":"SN001","cmd":"uptime"}`)
+	p := createProposal(t, s, "run_tunnel_cmd", `{"sn":"SN001","cmd":"uptime"}`)
 	if p.Status != StatusPending {
 		t.Fatalf("新建提案状态 = %s, want %s", p.Status, StatusPending)
 	}
@@ -40,7 +49,7 @@ func TestCreateStartsPending(t *testing.T) {
 // 返回的必须是副本：调用方改到手里的东西，不能影响 store 里的真实状态。
 func TestReturnedProposalIsCopy(t *testing.T) {
 	s := NewStore(WithClock(fixedClock()))
-	p := s.Create("t", "{}")
+	p := createProposal(t, s, "t", "{}")
 
 	p.Status = StatusExecuted
 	p.Args = "篡改过的参数"
@@ -60,7 +69,7 @@ func TestReturnedProposalIsCopy(t *testing.T) {
 // 这个用例是整套审核机制的核心不变量：没批准就不能进入执行态。
 func TestExecuteRequiresApproval(t *testing.T) {
 	s := NewStore(WithClock(fixedClock()))
-	p := s.Create("run_tunnel_cmd", "{}")
+	p := createProposal(t, s, "run_tunnel_cmd", "{}")
 
 	if _, err := s.MarkExecuted(p.ID, "output", nil); err == nil {
 		t.Fatal("未经批准就流转到执行态，审核闸门被绕过")
@@ -74,7 +83,7 @@ func TestExecuteRequiresApproval(t *testing.T) {
 
 func TestApproveThenExecute(t *testing.T) {
 	s := NewStore(WithClock(fixedClock()))
-	p := s.Create("run_tunnel_cmd", "{}")
+	p := createProposal(t, s, "run_tunnel_cmd", "{}")
 
 	approved, err := s.Approve(p.ID, "alice")
 	if err != nil {
@@ -88,6 +97,13 @@ func TestApproveThenExecute(t *testing.T) {
 	}
 	if approved.DecidedAt == nil {
 		t.Error("批准时间未记录")
+	}
+	claimed, err := s.ClaimExecution(p.ID)
+	if err != nil {
+		t.Fatalf("ClaimExecution() error = %v", err)
+	}
+	if claimed.Status != StatusExecuting || claimed.ExecutingAt == nil {
+		t.Fatalf("抢占后提案 = %#v", claimed)
 	}
 
 	done, err := s.MarkExecuted(p.ID, "load average: 0.1", nil)
@@ -107,19 +123,22 @@ func TestApproveThenExecute(t *testing.T) {
 
 func TestExecuteFailureRecorded(t *testing.T) {
 	s := NewStore(WithClock(fixedClock()))
-	p := s.Create("run_tunnel_cmd", "{}")
+	p := createProposal(t, s, "run_tunnel_cmd", "{}")
 	if _, err := s.Approve(p.ID, "alice"); err != nil {
 		t.Fatalf("Approve() error = %v", err)
 	}
+	if _, err := s.ClaimExecution(p.ID); err != nil {
+		t.Fatalf("ClaimExecution() error = %v", err)
+	}
 
-	done, err := s.MarkExecuted(p.ID, "", errors.New("连接超时"))
+	done, err := s.MarkExecuted(p.ID, "", errors.New("节点拒绝请求"))
 	if err != nil {
 		t.Fatalf("MarkExecuted() error = %v", err)
 	}
 	if done.Status != StatusFailed {
 		t.Errorf("状态 = %s, want %s", done.Status, StatusFailed)
 	}
-	if done.Error != "连接超时" {
+	if done.Error != "节点拒绝请求" {
 		t.Errorf("错误信息 = %q", done.Error)
 	}
 }
@@ -144,6 +163,9 @@ func TestTerminalStatesAreFinal(t *testing.T) {
 				if _, err := s.Approve(id, "alice"); err != nil {
 					t.Fatalf("Approve() error = %v", err)
 				}
+				if _, err := s.ClaimExecution(id); err != nil {
+					t.Fatalf("ClaimExecution() error = %v", err)
+				}
 				if _, err := s.MarkExecuted(id, "ok", nil); err != nil {
 					t.Fatalf("MarkExecuted() error = %v", err)
 				}
@@ -154,7 +176,7 @@ func TestTerminalStatesAreFinal(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			s := NewStore(WithClock(fixedClock()))
-			p := s.Create("run_tunnel_cmd", "{}")
+			p := createProposal(t, s, "run_tunnel_cmd", "{}")
 			tc.settle(t, s, p.ID)
 
 			if _, err := s.Approve(p.ID, "bob"); err == nil {
@@ -170,7 +192,7 @@ func TestTerminalStatesAreFinal(t *testing.T) {
 // 重复批准会导致同一条命令被执行两次，必须挡住。
 func TestApproveIsIdempotentlyRejected(t *testing.T) {
 	s := NewStore(WithClock(fixedClock()))
-	p := s.Create("run_tunnel_cmd", "{}")
+	p := createProposal(t, s, "run_tunnel_cmd", "{}")
 
 	if _, err := s.Approve(p.ID, "alice"); err != nil {
 		t.Fatalf("首次 Approve() error = %v", err)
@@ -199,7 +221,7 @@ func TestIDsAreUniqueAndOrdered(t *testing.T) {
 	seen := make(map[string]bool)
 	var created []string
 	for range 5 {
-		p := s.Create("t", "{}")
+		p := createProposal(t, s, "t", "{}")
 		if seen[p.ID] {
 			t.Fatalf("提案 ID 重复: %s", p.ID)
 		}
@@ -222,16 +244,19 @@ func TestAuditLogRecordsEveryTransition(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "audit.log")
 	s := NewStore(WithClock(fixedClock()), WithAuditLog(path))
 
-	p := s.Create("run_tunnel_cmd", `{"sn":"SN001","cmd":"systemctl restart foo"}`)
+	p := createProposal(t, s, "run_tunnel_cmd", `{"sn":"SN001","cmd":"systemctl restart foo"}`)
 	if _, err := s.Approve(p.ID, "alice"); err != nil {
 		t.Fatalf("Approve() error = %v", err)
+	}
+	if _, err := s.ClaimExecution(p.ID); err != nil {
+		t.Fatalf("ClaimExecution() error = %v", err)
 	}
 	if _, err := s.MarkExecuted(p.ID, "done", nil); err != nil {
 		t.Fatalf("MarkExecuted() error = %v", err)
 	}
 
 	events, lines := readAudit(t, path)
-	want := []string{"created", "approved", string(StatusExecuted)}
+	want := []string{"created", "approved", "executing", string(StatusExecuted)}
 	if strings.Join(events, ",") != strings.Join(want, ",") {
 		t.Errorf("审计事件 = %v, want %v", events, want)
 	}
@@ -249,7 +274,7 @@ func TestAuditLogRecordsRejection(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "audit.log")
 	s := NewStore(WithClock(fixedClock()), WithAuditLog(path))
 
-	p := s.Create("run_tunnel_cmd", "{}")
+	p := createProposal(t, s, "run_tunnel_cmd", "{}")
 	if _, err := s.Reject(p.ID, "bob", "影响面太大"); err != nil {
 		t.Fatalf("Reject() error = %v", err)
 	}
@@ -269,7 +294,7 @@ func TestAuditLogAppends(t *testing.T) {
 
 	for range 2 {
 		s := NewStore(WithClock(fixedClock()), WithAuditLog(path))
-		s.Create("t", "{}")
+		createProposal(t, s, "t", "{}")
 	}
 	events, _ := readAudit(t, path)
 	if len(events) != 2 {
@@ -287,7 +312,12 @@ func TestConcurrentCreateAndTransition(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			ids[i] = s.Create("t", "{}").ID
+			p, err := s.Create("t", "{}")
+			if err != nil {
+				t.Errorf("Create() error = %v", err)
+				return
+			}
+			ids[i] = p.ID
 		}(i)
 	}
 	wg.Wait()
@@ -316,6 +346,270 @@ func TestConcurrentCreateAndTransition(t *testing.T) {
 
 	if okCount != n {
 		t.Errorf("成功批准次数 = %d, want %d（存在重复批准）", okCount, n)
+	}
+}
+
+func TestPersistentStoreRestoresProposalsAndSequence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "approvals.json")
+	s, err := OpenStore(WithStateFile(path), WithClock(fixedClock()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := createProposal(t, s, "run_tunnel_cmd", `{"sn":"SN001","cmd":"date"}`)
+	executed := createProposal(t, s, "run_tunnel_cmd", `{"sn":"SN002","cmd":"uptime"}`)
+	if _, err := s.Approve(executed.ID, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimExecution(executed.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MarkExecuted(executed.ID, "ok", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenStore(WithStateFile(path), WithClock(fixedClock()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reopened.Pending(); len(got) != 1 || got[0].ID != pending.ID || got[0].Args != pending.Args {
+		t.Fatalf("恢复的待审提案=%#v", got)
+	}
+	restored, ok := reopened.Get(executed.ID)
+	if !ok || restored.Status != StatusExecuted || restored.Result != "ok" ||
+		restored.IdempotencyKey != executed.IdempotencyKey {
+		t.Fatalf("恢复的已执行提案=%#v", restored)
+	}
+	next := createProposal(t, reopened, "run_tunnel_cmd", "{}")
+	if next.ID != "P003" {
+		t.Fatalf("重启后新提案 ID=%s, want P003", next.ID)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("状态文件权限=%o, want 600", info.Mode().Perm())
+	}
+}
+
+func TestPersistentStoreTightensExistingFilePermissions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "approvals.json")
+	s, err := OpenStore(WithStateFile(path), WithClock(fixedClock()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	createProposal(t, s, "run_tunnel_cmd", "{}")
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := OpenStore(WithStateFile(path), WithClock(fixedClock())); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("恢复后状态文件权限=%o, want 600", info.Mode().Perm())
+	}
+}
+
+func TestPersistentStoreRecoversExecutingAsUnknown(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "approvals.json")
+	s, err := OpenStore(WithStateFile(path), WithClock(fixedClock()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := createProposal(t, s, "run_tunnel_cmd", `{"sn":"SN001","cmd":"restart"}`)
+	if _, err := s.Approve(p.ID, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimExecution(p.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenStore(WithStateFile(path), WithClock(fixedClock()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, ok := reopened.Get(p.ID)
+	if !ok || recovered.Status != StatusUnknown || recovered.FinishedAt == nil {
+		t.Fatalf("恢复结果=%#v", recovered)
+	}
+	if !strings.Contains(recovered.Error, "可能已经生效") || !strings.Contains(recovered.Error, "禁止自动重试") {
+		t.Fatalf("unknown 原因不完整: %q", recovered.Error)
+	}
+	if _, err := reopened.Approve(p.ID, "bob"); err == nil {
+		t.Fatal("unknown 提案不应再次批准")
+	}
+	if _, err := reopened.ClaimExecution(p.ID); err == nil {
+		t.Fatal("unknown 提案不应再次取得执行权")
+	}
+}
+
+func TestPersistentStoreBindsInterruptOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "approvals.json")
+	s, err := OpenStore(WithStateFile(path), WithClock(fixedClock()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := createProposal(t, s, "run_tunnel_cmd", "{}")
+	bound, err := s.BindInterrupt(p.ID, "checkpoint-1", "interrupt-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bound.CheckpointID != "checkpoint-1" || bound.InterruptID != "interrupt-1" {
+		t.Fatalf("中断关联=%#v", bound)
+	}
+	if _, err := s.BindInterrupt(p.ID, "checkpoint-1", "interrupt-1"); err != nil {
+		t.Fatalf("相同关联的幂等写入失败: %v", err)
+	}
+	if _, err := s.BindInterrupt(p.ID, "checkpoint-2", "interrupt-2"); err == nil {
+		t.Fatal("已有中断关联被替换")
+	}
+
+	reopened, err := OpenStore(WithStateFile(path), WithClock(fixedClock()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, _ := reopened.Get(p.ID)
+	if restored.CheckpointID != "checkpoint-1" || restored.InterruptID != "interrupt-1" {
+		t.Fatalf("重启后中断关联=%#v", restored)
+	}
+}
+
+func TestPersistentStoreWriteFailureRollsBack(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "approvals.json")
+	s, err := OpenStore(WithStateFile(path), WithClock(fixedClock()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Create("run_tunnel_cmd", "{}"); err == nil {
+		t.Fatal("状态路径是目录时 Create 应失败")
+	}
+	if len(s.All()) != 0 || len(s.Pending()) != 0 {
+		t.Fatalf("写盘失败后仍有内存提案: %#v", s.All())
+	}
+}
+
+func TestPersistentStoreTransitionFailureRollsBack(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "approvals.json")
+	s, err := OpenStore(WithStateFile(path), WithClock(fixedClock()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := createProposal(t, s, "run_tunnel_cmd", "{}")
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Approve(p.ID, "alice"); err == nil {
+		t.Fatal("状态文件不可替换时 Approve 应失败")
+	}
+	got, ok := s.Get(p.ID)
+	if !ok || got.Status != StatusPending || got.Decider != "" || got.DecidedAt != nil {
+		t.Fatalf("写盘失败后内存状态未回滚: %#v", got)
+	}
+}
+
+func TestStoreRejectsInvalidCreationAndDecisionActors(t *testing.T) {
+	s := NewStore(WithClock(fixedClock()))
+	if _, err := s.Create(" ", "{}"); err == nil {
+		t.Fatal("空工具名应被拒绝")
+	}
+	p := createProposal(t, s, "run_tunnel_cmd", "{}")
+	if _, err := s.Approve(p.ID, " "); err == nil {
+		t.Fatal("空批准人应被拒绝")
+	}
+	if _, err := s.Reject(p.ID, " ", "reason"); err == nil {
+		t.Fatal("空驳回人应被拒绝")
+	}
+	got, _ := s.Get(p.ID)
+	if got.Status != StatusPending {
+		t.Fatalf("非法决定改变了状态: %#v", got)
+	}
+}
+
+func TestPersistentStoreRejectsCorruptState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "approvals.json")
+	if err := os.WriteFile(path, []byte(`{"version":1,"sequence":1,"proposals":[{"id":"P001","tool":"run_tunnel_cmd","args":"{}","idempotency_key":"tampered","status":"pending","created_at":"2026-07-30T10:00:00Z"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenStore(WithStateFile(path), WithClock(fixedClock())); err == nil ||
+		!strings.Contains(err.Error(), "idempotency_key") {
+		t.Fatalf("损坏状态未被拒绝: %v", err)
+	}
+}
+
+func TestPersistentStoreRejectsPartialDecision(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "approvals.json")
+	s, err := OpenStore(WithStateFile(path), WithClock(fixedClock()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	createProposal(t, s, "run_tunnel_cmd", "{}")
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state map[string]any
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatal(err)
+	}
+	proposals := state["proposals"].([]any)
+	proposals[0].(map[string]any)["decider"] = "alice"
+	data, err = json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := OpenStore(WithStateFile(path), WithClock(fixedClock())); err == nil ||
+		!strings.Contains(err.Error(), "decider 和 decided_at") {
+		t.Fatalf("不完整审核决定未被拒绝: %v", err)
+	}
+}
+
+func TestPersistentStoreRejectsWhitespaceDecisionActor(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "approvals.json")
+	s, err := OpenStore(WithStateFile(path), WithClock(fixedClock()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	createProposal(t, s, "run_tunnel_cmd", "{}")
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state map[string]any
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatal(err)
+	}
+	proposals := state["proposals"].([]any)
+	proposals[0].(map[string]any)["decider"] = " "
+	data, err = json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := OpenStore(WithStateFile(path), WithClock(fixedClock())); err == nil ||
+		!strings.Contains(err.Error(), "decider 不能包含首尾空白") {
+		t.Fatalf("空白审核人未被拒绝: %v", err)
 	}
 }
 

@@ -21,9 +21,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.appendEntry(roleIntent, fmt.Sprintf("%s · %d%%%s",
 			event.result.Intent.Label(), int(event.result.Confidence*100+0.5), suffix))
 		return m, m.waitForEvent()
+	case agentProgressMsg:
+		if strings.TrimSpace(event.text) != "" {
+			m.flushStreaming()
+			m.appendEntry(roleProgress, strings.TrimSpace(event.text))
+		}
+		return m, m.waitForEvent()
+	case reasoningChunkMsg:
+		m.appendStreaming(roleReasoning, event.chunk)
+		return m, m.waitForEvent()
 	case assistantChunkMsg:
-		m.streaming += event.chunk
-		m.scrollOffset = 0
+		m.assistantStreamed = true
+		m.appendStreaming(roleAssistant, event.chunk)
 		return m, m.waitForEvent()
 	case logMsg:
 		if strings.TrimSpace(event.line) != "" {
@@ -58,12 +67,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	if key, ok := msg.(tea.KeyMsg); ok && key.Type == tea.KeyCtrlC {
-		m.cancelAll()
-		return m, tea.Quit
-	}
 	if key, ok := msg.(tea.KeyMsg); ok {
 		switch key.Type {
+		case tea.KeyCtrlC:
+			m.cancelAll()
+			return m, tea.Quit
+		case tea.KeyF2:
+			m.copyMode = !m.copyMode
+			m.scrollDragging = false
+			if m.copyMode {
+				return m, tea.DisableMouse
+			}
+			return m, tea.EnableMouseCellMotion
+		case tea.KeyEsc:
+			if m.copyMode {
+				m.copyMode = false
+				return m, tea.EnableMouseCellMotion
+			}
 		case tea.KeyPgUp:
 			m.scrollBy(m.scrollPageSize())
 			return m, nil
@@ -72,10 +92,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	}
-	if mouse, ok := msg.(tea.MouseMsg); ok && m.updateScrollMouse(mouse) {
-		return m, nil
+	if mouse, ok := msg.(tea.MouseMsg); ok {
+		if m.copyMode || m.updateScrollMouse(mouse) {
+			return m, nil
+		}
 	}
-
 	switch m.mode {
 	case modeInput:
 		return m.updateInput(msg)
@@ -93,6 +114,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) updateInput(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if key, ok := msg.(tea.KeyMsg); ok {
+		switch key.Type {
+		case tea.KeyUp:
+			m.previousInput()
+			return m, nil
+		case tea.KeyDown:
+			m.nextInput()
+			return m, nil
+		default:
+			if mutatesInput(key) {
+				m.resetHistoryNavigation()
+			}
+		}
+	}
 	updated, _ := m.input.Update(msg)
 	m.input = updated.(uiinput.Model)
 	if !m.input.Done() {
@@ -108,5 +143,6 @@ func (m Model) updateInput(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if line == "" {
 		return m, nil
 	}
+	m.rememberInput(line)
 	return m.submit(line)
 }

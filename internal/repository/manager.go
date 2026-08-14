@@ -106,7 +106,7 @@ func (m *Manager) Add(ctx context.Context, path, name string) (Info, error) {
 		return Info{}, fmt.Errorf("仓库名称 %q 已存在", name)
 	}
 
-	idx, err := buildIndex(ctx, root, nil)
+	idx, err := buildIndex(ctx, root, nil, m.indexIgnoredFiles(root))
 	if err != nil {
 		return Info{}, fmt.Errorf("索引仓库 %q: %w", name, err)
 	}
@@ -202,7 +202,7 @@ func (m *Manager) Reindex(ctx context.Context) (Info, error) {
 		return Info{}, errors.New("尚未选择代码仓库，请先使用 /repo add 或 /repo use")
 	}
 
-	idx, err := buildIndex(ctx, item.Root, previous)
+	idx, err := buildIndex(ctx, item.Root, previous, m.indexIgnoredFiles(item.Root))
 	if err != nil {
 		return Info{}, fmt.Errorf("重新索引仓库 %q: %w", item.Name, err)
 	}
@@ -269,7 +269,7 @@ func (m *Manager) ensureIndex(ctx context.Context, key string, item Info) (*inde
 	if idx != nil {
 		return idx, nil
 	}
-	idx, err := buildIndex(ctx, item.Root, nil)
+	idx, err := buildIndex(ctx, item.Root, nil, m.indexIgnoredFiles(item.Root))
 	if err != nil {
 		return nil, fmt.Errorf("加载仓库 %q 的索引: %w", item.Name, err)
 	}
@@ -288,16 +288,53 @@ func (m *Manager) ensureIndex(ctx context.Context, key string, item Info) (*inde
 	return idx, nil
 }
 
-func (m *Manager) snapshot(info Info, idx *index) Snapshot {
+func (m *Manager) snapshot(ctx context.Context, info Info, idx *index) Snapshot {
 	current := readGitInfo(info.Root)
-	return Snapshot{
-		Repository:   info.Name,
-		GitCommit:    info.GitCommit,
-		GitBranch:    info.GitBranch,
-		IndexVersion: info.IndexVersion,
-		IndexedAt:    info.IndexedAt,
-		Stale:        current.Commit != info.GitCommit || indexFilesChanged(info.Root, idx),
+	reasons := make(map[StaleReason]struct{})
+	if current.Commit != info.GitCommit {
+		reasons[StaleGitCommitChanged] = struct{}{}
 	}
+	fileReasons, stalePaths := indexFileChanges(ctx, info.Root, idx)
+	for _, reason := range fileReasons {
+		reasons[reason] = struct{}{}
+	}
+	ordered := orderedStaleReasons(reasons)
+	return Snapshot{
+		Repository:       info.Name,
+		GitCommit:        info.GitCommit,
+		CurrentGitCommit: current.Commit,
+		GitBranch:        info.GitBranch,
+		IndexVersion:     info.IndexVersion,
+		IndexedAt:        info.IndexedAt,
+		Stale:            len(ordered) > 0,
+		StaleReasons:     ordered,
+		StalePaths:       stalePaths,
+	}
+}
+
+func (m *Manager) indexIgnoredFiles(root string) map[string]struct{} {
+	ignored := make(map[string]struct{})
+	if m.statePath == "" {
+		return ignored
+	}
+	statePath, err := filepath.Abs(m.statePath)
+	if err != nil {
+		return ignored
+	}
+	stateDir, err := filepath.EvalSymlinks(filepath.Dir(statePath))
+	if err != nil {
+		return ignored
+	}
+	statePath = filepath.Join(stateDir, filepath.Base(statePath))
+	rel, err := filepath.Rel(root, filepath.Clean(statePath))
+	if err != nil {
+		return ignored
+	}
+	rel = filepath.ToSlash(rel)
+	if rel != "." && rel != ".." && !strings.HasPrefix(rel, "../") {
+		ignored[rel] = struct{}{}
+	}
+	return ignored
 }
 
 func (m *Manager) saveLocked() error {

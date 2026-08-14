@@ -27,6 +27,25 @@ func (fakeConversationAgent) Stream(_ context.Context, _ []*schema.Message,
 	return "第一段，第二段", nil
 }
 
+type fakeProgressiveConversationAgent struct{ fakeConversationAgent }
+
+func (fakeProgressiveConversationAgent) StreamWithProgress(
+	_ context.Context,
+	_ []*schema.Message,
+	onIntent func(intent.Result),
+	onProgress func(string),
+	onReasoning func(string),
+	onChunk func(string),
+) (string, error) {
+	onIntent(intent.Result{Intent: intent.CodeRepositoryQuestion, Confidence: 0.99})
+	onProgress("已进入代码仓库问答流程，正在规划下一步。")
+	onReasoning("先确认仓库版本，")
+	onReasoning("再检查相关源码。")
+	onProgress("调用工具：get_repository_revision")
+	onChunk("当前项目包含三项更新。")
+	return "当前项目包含三项更新。", nil
+}
+
 func newRootModel(t *testing.T, events chan tea.Msg) Model {
 	t.Helper()
 	store, err := session.OpenStore(0, 1000, "")
@@ -41,6 +60,7 @@ func newRootModel(t *testing.T, events chan tea.Msg) Model {
 func TestRootModelUnicodeInputAndStreaming(t *testing.T) {
 	events := make(chan tea.Msg, 8)
 	model := newRootModel(t, events)
+	model = updateRoot(t, model, tea.WindowSizeMsg{Width: 80, Height: 20})
 	model = updateRoot(t, model, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("插件坏坏")})
 	model = updateRoot(t, model, tea.KeyMsg{Type: tea.KeyBackspace})
 	if model.InputValue() != "插件坏" {
@@ -51,6 +71,9 @@ func TestRootModelUnicodeInputAndStreaming(t *testing.T) {
 	model = updated.(Model)
 	if cmd == nil || model.Mode() != "busy" || model.InputValue() != "" {
 		t.Fatalf("提交后 mode=%q input=%q cmd nil=%v", model.Mode(), model.InputValue(), cmd == nil)
+	}
+	if view := model.View(); !strings.Contains(view, "› 正在处理，请稍候") {
+		t.Fatalf("处理中输入栏消失：\n%s", view)
 	}
 	if msg := cmd(); msg != nil {
 		t.Fatalf("后台命令应通过统一事件通道投递，直接返回了 %T", msg)
@@ -67,6 +90,47 @@ func TestRootModelUnicodeInputAndStreaming(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Errorf("transcript 没有 %q:\n%s", want, text)
 		}
+	}
+}
+
+func TestRootModelDisplaysAgentProgressAndReasoningInOrder(t *testing.T) {
+	events := make(chan tea.Msg, 16)
+	store, err := session.OpenStore(0, 1000, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, _ := store.Current()
+	app := chat.NewApp(fakeProgressiveConversationAgent{}, store, current, 1024, "auto")
+	model := NewModel(context.Background(), app, events, ModelConfig{InputMaxBytes: 1024})
+
+	model = updateRoot(t, model, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("项目更新了什么？")})
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if cmd == nil {
+		t.Fatal("提交后没有后台命令")
+	}
+	_ = cmd()
+	for len(events) > 0 {
+		model = updateRoot(t, model, <-events)
+	}
+
+	text := model.TranscriptText()
+	wants := []string{
+		"progress: 已进入代码仓库问答流程",
+		"reasoning: 先确认仓库版本，再检查相关源码。",
+		"progress: 调用工具：get_repository_revision",
+		"assistant: 当前项目包含三项更新。",
+	}
+	previous := -1
+	for _, want := range wants {
+		index := strings.Index(text, want)
+		if index < 0 {
+			t.Fatalf("对话记录缺少 %q：\n%s", want, text)
+		}
+		if index <= previous {
+			t.Fatalf("过程展示顺序不正确，%q 出现在前一项之前：\n%s", want, text)
+		}
+		previous = index
 	}
 }
 
@@ -236,6 +300,178 @@ func TestRootModelConversationScrollbarSupportsKeyboardAndMouse(t *testing.T) {
 	model = updateRoot(t, model, tea.WindowSizeMsg{Width: 25, Height: 12})
 	assertViewBounds(t, model.View(), 25, 12)
 	scrollbarThumbRows(t, model.View())
+}
+
+func TestRootModelCopyModeDisablesMouseAndRestoresScrolling(t *testing.T) {
+	const (
+		width  = 42
+		height = 16
+	)
+	model := newRootModel(t, nil)
+	model = updateRoot(t, model, tea.WindowSizeMsg{Width: width, Height: height})
+	for range 8 {
+		model = submitRootLine(t, model, "/help")
+	}
+	trackTop, _ := scrollbarTrackBounds(t, model.View())
+	bottomThumb := scrollbarThumbRows(t, model.View())
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyF2})
+	model = updated.(Model)
+	if !model.CopyMode() || cmd == nil || cmd() == nil {
+		t.Fatalf("F2 后 copyMode=%v cmd nil=%v", model.CopyMode(), cmd == nil)
+	}
+	copyView := model.View()
+	for range 6 {
+		model = updateRoot(t, model, tea.MouseMsg{
+			X: width - 2, Y: trackTop + 1, Button: tea.MouseButtonWheelUp, Action: tea.MouseActionPress,
+		})
+	}
+	if view := model.View(); view != copyView {
+		t.Fatalf("复制模式仍响应了鼠标事件：\n%s", view)
+	}
+
+	updated, cmd = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(Model)
+	if model.CopyMode() || cmd == nil || cmd() == nil {
+		t.Fatalf("Esc 后 copyMode=%v cmd nil=%v", model.CopyMode(), cmd == nil)
+	}
+	for range 6 {
+		model = updateRoot(t, model, tea.MouseMsg{
+			X: width - 2, Y: trackTop + 1, Button: tea.MouseButtonWheelUp, Action: tea.MouseActionPress,
+		})
+	}
+	restoredThumb := scrollbarThumbRows(t, model.View())
+	if restoredThumb[0] >= bottomThumb[0] {
+		t.Fatalf("退出复制模式后滚轮未恢复: before=%v after=%v", bottomThumb, restoredThumb)
+	}
+
+	updated, cmd = model.Update(tea.KeyMsg{Type: tea.KeyF2})
+	model = updated.(Model)
+	if !model.CopyMode() || cmd == nil {
+		t.Fatal("再次按 F2 没有进入复制模式")
+	}
+	updated, cmd = model.Update(tea.KeyMsg{Type: tea.KeyF2})
+	model = updated.(Model)
+	if model.CopyMode() || cmd == nil || cmd() == nil {
+		t.Fatal("再次按 F2 没有返回交互模式")
+	}
+}
+
+func TestRootModelInputHistoryBrowsesNewestFirstAndRestoresDraft(t *testing.T) {
+	model := newRootModel(t, nil)
+	model = submitRootLine(t, model, "/help")
+	model = submitRootLine(t, model, "/repos")
+	model = updateRoot(t, model, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("未提交草稿")})
+
+	model = updateRoot(t, model, tea.KeyMsg{Type: tea.KeyUp})
+	if model.InputValue() != "/repos" {
+		t.Fatalf("第一次 ↑ 后 input=%q", model.InputValue())
+	}
+	model = updateRoot(t, model, tea.KeyMsg{Type: tea.KeyUp})
+	if model.InputValue() != "/help" {
+		t.Fatalf("第二次 ↑ 后 input=%q", model.InputValue())
+	}
+	model = updateRoot(t, model, tea.KeyMsg{Type: tea.KeyUp})
+	if model.InputValue() != "/help" {
+		t.Fatalf("越过最旧记录后 input=%q", model.InputValue())
+	}
+
+	model = updateRoot(t, model, tea.KeyMsg{Type: tea.KeyDown})
+	if model.InputValue() != "/repos" {
+		t.Fatalf("第一次 ↓ 后 input=%q", model.InputValue())
+	}
+	model = updateRoot(t, model, tea.KeyMsg{Type: tea.KeyDown})
+	if model.InputValue() != "未提交草稿" {
+		t.Fatalf("返回草稿后 input=%q", model.InputValue())
+	}
+}
+
+func TestRootModelInputHistoryEditLeavesBrowsingAndDeduplicates(t *testing.T) {
+	model := newRootModel(t, nil)
+	model = updateRoot(t, model, tea.KeyMsg{Type: tea.KeyEnter})
+	model = submitRootLine(t, model, "/help")
+	model = submitRootLine(t, model, "/help")
+
+	model = updateRoot(t, model, tea.KeyMsg{Type: tea.KeyUp})
+	model = updateRoot(t, model, tea.KeyMsg{Type: tea.KeyBackspace})
+	if model.InputValue() != "/hel" {
+		t.Fatalf("编辑历史记录后 input=%q", model.InputValue())
+	}
+	model = updateRoot(t, model, tea.KeyMsg{Type: tea.KeyDown})
+	if model.InputValue() != "/hel" {
+		t.Fatalf("脱离浏览后 ↓ 不应替换输入，input=%q", model.InputValue())
+	}
+	model = updateRoot(t, model, tea.KeyMsg{Type: tea.KeyUp})
+	if model.InputValue() != "/help" {
+		t.Fatalf("空输入和连续重复项不应增加历史，input=%q", model.InputValue())
+	}
+	model = updateRoot(t, model, tea.KeyMsg{Type: tea.KeyDown})
+	if model.InputValue() != "/hel" {
+		t.Fatalf("再次浏览后未恢复编辑草稿，input=%q", model.InputValue())
+	}
+}
+
+func TestRootModelInputHistoryIsIsolatedBySession(t *testing.T) {
+	store, err := session.OpenStore(0, 1000, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, firstInfo := store.Current()
+	_, secondInfo, err := store.Create("第二会话")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Select(firstInfo.ID); err != nil {
+		t.Fatal(err)
+	}
+	app := chat.NewApp(fakeConversationAgent{}, store, first, 1024, "auto")
+	model := NewModel(context.Background(), app, nil, ModelConfig{InputMaxBytes: 1024})
+
+	model = submitRootLine(t, model, "/help")
+	if _, err := app.SwitchSession(secondInfo.ID); err != nil {
+		t.Fatal(err)
+	}
+	model = updateRoot(t, model, tea.KeyMsg{Type: tea.KeyUp})
+	if model.InputValue() != "" {
+		t.Fatalf("新会话泄漏了旧会话输入：%q", model.InputValue())
+	}
+	model = submitRootLine(t, model, "/repos")
+
+	if _, err := app.SwitchSession(firstInfo.ID); err != nil {
+		t.Fatal(err)
+	}
+	model = updateRoot(t, model, tea.KeyMsg{Type: tea.KeyUp})
+	if model.InputValue() != "/help" {
+		t.Fatalf("切回首个会话后 input=%q", model.InputValue())
+	}
+}
+
+func TestRootModelFooterDocumentsCopyAndKeyboardHistory(t *testing.T) {
+	model := newRootModel(t, nil)
+	model = updateRoot(t, model, tea.WindowSizeMsg{Width: 100, Height: 20})
+	view := model.View()
+	for _, want := range []string{"↑/↓ 历史输入", "滚轮/PgUp/PgDn 滚动", "F2 复制模式"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("页脚缺少 %q:\n%s", want, view)
+		}
+	}
+	if strings.Contains(view, "Shift+拖选") {
+		t.Fatalf("页脚仍提示不可靠的 Shift 拖选：\n%s", view)
+	}
+
+	model = updateRoot(t, model, tea.KeyMsg{Type: tea.KeyF2})
+	view = model.View()
+	for _, want := range []string{"复制模式", "鼠标拖选文字", "Cmd-C 复制", "F2/Esc 返回"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("复制模式页脚缺少 %q:\n%s", want, view)
+		}
+	}
+}
+
+func submitRootLine(t *testing.T, model Model, line string) Model {
+	t.Helper()
+	model = updateRoot(t, model, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(line)})
+	return updateRoot(t, model, tea.KeyMsg{Type: tea.KeyEnter})
 }
 
 func assertViewBounds(t *testing.T, view string, width, height int) {

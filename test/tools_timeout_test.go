@@ -77,8 +77,8 @@ func TestExecutionTimesOut(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &resp); err != nil {
 		t.Fatalf("返回不是合法 JSON: %v", err)
 	}
-	if resp.Status != string(approval.StatusFailed) {
-		t.Errorf("status = %q, want failed", resp.Status)
+	if resp.Status != string(approval.StatusUnknown) {
+		t.Errorf("status = %q, want unknown", resp.Status)
 	}
 	// 模型和人都要看到「超时」两个字，而不是 context deadline exceeded。
 	if !strings.Contains(resp.Error, "调用超时") {
@@ -89,8 +89,8 @@ func TestExecutionTimesOut(t *testing.T) {
 	}
 
 	p, _ := store.Get(resp.ProposalID)
-	if p.Status != approval.StatusFailed {
-		t.Errorf("提案状态 = %s, want failed", p.Status)
+	if p.Status != approval.StatusUnknown {
+		t.Errorf("提案状态 = %s, want unknown", p.Status)
 	}
 	if !strings.Contains(p.Error, "调用超时") {
 		t.Errorf("审计日志里的失败原因 = %q", p.Error)
@@ -135,6 +135,28 @@ func TestZeroTimeoutMeansNoLimit(t *testing.T) {
 	}
 	if real.runs.Load() != 1 {
 		t.Errorf("执行次数 = %d, want 1", real.runs.Load())
+	}
+}
+
+func TestCallerDeadlineWithoutGateTimeoutIsUnknown(t *testing.T) {
+	ctx := context.Background()
+	real := newFakeMutating("run_tunnel_cmd")
+	real.err = context.DeadlineExceeded
+	ap := &stubApprover{decision: Decision{Approved: true, Decider: "alice"}}
+	store := approval.NewStore()
+	gate := NewGate(store, WithApprover(ap), WithTimeout(0))
+
+	gated, _ := gate.Wrap(ctx, real)
+	out, err := gated.InvokableRun(ctx, `{"sn":"SN001","cmd":"date"}`)
+	if err != nil {
+		t.Fatalf("InvokableRun() error = %v", err)
+	}
+	var resp gateResponse
+	if err := json.Unmarshal([]byte(out), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Status != string(approval.StatusUnknown) || !strings.Contains(resp.Error, "期限") {
+		t.Fatalf("deadline 返回=%#v, want unknown", resp)
 	}
 }
 
