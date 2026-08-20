@@ -61,11 +61,25 @@ func Run() error {
 	if err != nil {
 		return fmt.Errorf("打开提案状态存储失败: %w", err)
 	}
-	gate := tools.NewGate(
-		proposalStore,
+
+	// 快照目录可用时，等人确认的那段时间落盘，进程退出后仍能恢复同一轮。
+	// 打不开就退回同步审核：审批本身不能因为快照没准备好而失效。
+	var checkpoints *approval.CheckpointStore
+	if cfg.CheckpointDir != "" {
+		checkpoints, err = approval.OpenCheckpointStore(cfg.CheckpointDir)
+		if err != nil {
+			return fmt.Errorf("打开中断快照存储失败: %w", err)
+		}
+	}
+
+	gateOptions := []tools.GateOption{
 		tools.WithApprover(approver),
 		tools.WithTimeout(cfg.ToolTimeout),
-	)
+	}
+	if checkpoints != nil {
+		gateOptions = append(gateOptions, tools.WithDurablePause())
+	}
+	gate := tools.NewGate(proposalStore, gateOptions...)
 	repositoryManager, err := repository.Open(cfg.RepositoryFile)
 	if err != nil {
 		return fmt.Errorf("打开代码仓库目录失败: %w", err)
@@ -75,7 +89,11 @@ func Run() error {
 		return err
 	}
 
-	diagnosticAgent, err := agent.New(ctx, chatModel, registry, cfg)
+	var agentOptions []agent.Option
+	if checkpoints != nil {
+		agentOptions = append(agentOptions, agent.WithDurablePause(checkpoints, gate))
+	}
+	diagnosticAgent, err := agent.New(ctx, chatModel, registry, cfg, agentOptions...)
 	if err != nil {
 		return err
 	}
@@ -89,9 +107,11 @@ func Run() error {
 	}
 
 	chatApp := chat.NewApp(diagnosticAgent, sessionStore, currentSession, cfg.ImageMaxBytes, cfg.ImageDetail, repositoryManager)
+	chatApp.EnableApprovals(gate, cfg.Operator)
 	model := ui.NewModel(ctx, chatApp, events, ui.ModelConfig{
 		Banner: ui.StartupBanner(startupInfo(
 			cfg, registry, diagnosticAgent.SkillNames(), activeSession, currentSession,
+			len(chatApp.PendingApprovals()),
 		)),
 		InputMaxBytes: ui.InputMaxBytes(cfg.ContextTokens),
 	})
@@ -167,7 +187,7 @@ func registerTools(ctx context.Context, gate *tools.Gate, timeout time.Duration,
 }
 
 func startupInfo(cfg *config.Config, registry *tools.Registry, skillNames []string,
-	active session.Info, current *session.Session) ui.StartupInfo {
+	active session.Info, current *session.Session, pendingApprovals int) ui.StartupInfo {
 	toolSummaries := make([]ui.ToolSummary, 0, len(registry.Entries()))
 	for _, entry := range registry.Entries() {
 		domains := make([]string, 0, len(entry.Domains))
@@ -179,12 +199,13 @@ func startupInfo(cfg *config.Config, registry *tools.Registry, skillNames []stri
 		})
 	}
 	return ui.StartupInfo{
-		Config:      cfg.Redacted(),
-		Tools:       toolSummaries,
-		Skills:      append([]string(nil), skillNames...),
-		SessionName: active.Name,
-		SessionID:   active.ShortID(),
-		Messages:    current.Len(),
-		Tokens:      current.EstimatedTokens(),
+		Config:           cfg.Redacted(),
+		Tools:            toolSummaries,
+		Skills:           append([]string(nil), skillNames...),
+		SessionName:      active.Name,
+		SessionID:        active.ShortID(),
+		Messages:         current.Len(),
+		Tokens:           current.EstimatedTokens(),
+		PendingApprovals: pendingApprovals,
 	}
 }

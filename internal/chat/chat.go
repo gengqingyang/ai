@@ -40,6 +40,10 @@ type App struct {
 	imageMaxBytes int
 	imageDetail   string
 	repositories  *repository.Manager
+
+	// approvals 和 operator 由 EnableApprovals 装上，开启 /approvals。
+	approvals ApprovalGate
+	operator  string
 }
 
 // NewApp 创建聊天应用实例。
@@ -223,6 +227,9 @@ func (a *App) RunCommand(ctx context.Context, line string) (bool, error) {
 		return true, nil
 	case "/repo":
 		_, err := a.RunRepositoryCommand(ctx, line)
+		return true, err
+	case "/approvals":
+		_, err := a.RunApprovalCommand(ctx, line, nil, nil, nil)
 		return true, err
 	case "/new":
 		_, err := a.CreateSession(CommandArgs(line))

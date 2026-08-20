@@ -5,3 +5,5 @@ bin/
 .chat_history_sessions/
 .repositories.json
 .approvals.json
+.checkpoints/
+.codegraph

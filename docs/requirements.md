@@ -32,7 +32,7 @@
 | 真实只读诊断数据工具 | 已完成（M1 首版） | Tunnel 固定模板覆盖装机、流量、插件、内核和网络当前快照 |
 | 故障类型子图 | 已完成（M3 第二阶段） | compose.Graph 已完成分类路由；五类故障具备独立 prompt、领域工具白名单，以及固定只读工具的并行采证和确定性证据校验节点 |
 | 本地代码仓库问答 | 已完成（M2 首版） | 命名仓库、安全索引、七个只读工具、代码专用路由和 path:line 引用 |
-| 提案持久化与异步审批 | 部分完成（P1） | 提案、决定、原始参数、幂等键和原子执行权已落盘；Eino interrupt/checkpoint Resume 待接入 |
+| 提案持久化与可恢复审批 | 已完成（P1） | 提案、决定、原始参数、幂等键和原子执行权已落盘；Eino StatefulInterrupt、持久化 checkpoint store 和 Runner Resume 已接入，`/approvals` 可处理重启前挂起的那一轮 |
 
 ## 3. 用户与核心场景
 
@@ -114,7 +114,7 @@
 
 **FR-APPROVAL-001 提案持久化**
 
-当前状态：项目审批层持久化首版已完成。版本化 JSON 状态文件以 `0600` 权限原子替换，保存提案、原始参数、幂等键、决定、执行状态、结果及 checkpoint/interrupt 关联字段；启动可恢复待审和已批准提案。真实工具下发前必须原子抢占 `executing`，重启发现 `executing` 会转为不可重试的 `unknown`。Eino `StatefulInterrupt`、持久化 checkpoint store、外部审核鉴权和 Runner Resume 尚未完成。
+当前状态：已完成。版本化 JSON 状态文件以 `0600` 权限原子替换，保存提案、原始参数、幂等键、决定、执行状态、结果及 checkpoint/interrupt/flow 关联字段；启动可恢复待审和已批准提案。真实工具下发前必须原子抢占 `executing`，重启发现 `executing` 会转为不可重试的 `unknown`。等待审核期间本轮挂成 Eino `StatefulInterrupt` 并把执行上下文写入 `AGENT_CHECKPOINT_DIR`（`0700` 目录 / `0600` 文件、原子替换、checkpoint_id 字符集 fail-closed）；决定先原子落盘再 Resume，恢复通道不携带任何决定，被唤醒的工具回提案存储读状态和原始参数。`/approvals` 同时列出待审和「已决定但那一轮未接回」的提案。仅外部审核鉴权尚未落地——当前决定人取自 `OPERATOR`，未做身份校验。
 
 - 将提案、状态流转、原始参数和幂等键持久化，重启后仍可查询和处理待审项。
 - 使用 Eino `StatefulInterrupt`、Checkpoint 和 Resume 管理 Graph 的暂停与恢复；持久化 `proposal_id`、`checkpoint_id` 和 `interrupt_id` 的关联。

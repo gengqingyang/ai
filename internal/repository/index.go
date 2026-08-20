@@ -625,7 +625,9 @@ func orderedStaleReasons(found map[StaleReason]struct{}) []StaleReason {
 
 func excludedDir(name string) bool {
 	switch strings.ToLower(name) {
-	case ".git", ".hg", ".svn", ".chat_history_sessions", "node_modules", "vendor", "bin", "dist", "build", "target", "coverage", ".cache", "__pycache__":
+	// .checkpoints 里是中断快照，含本轮完整模型消息（可能包括截图 base64）。
+	// 它和 .chat_history_sessions 同性质：属于本工具的运行状态，不是被诊断仓库的代码。
+	case ".git", ".hg", ".svn", ".chat_history_sessions", ".checkpoints", "node_modules", "vendor", "bin", "dist", "build", "target", "coverage", ".cache", "__pycache__":
 		return true
 	default:
 		return false
@@ -644,7 +646,9 @@ func excludedFile(path string) bool {
 		return true
 	}
 	switch strings.ToLower(filepath.Ext(base)) {
-	case ".pem", ".key", ".p12", ".pfx", ".der", ".crt":
+	// .ckpt 是中断快照。目录名可由 AGENT_CHECKPOINT_DIR 改掉，所以除了排除
+	// 默认目录，后缀本身也要挡一道，快照落到哪儿都不会被当成源码索引。
+	case ".pem", ".key", ".p12", ".pfx", ".der", ".crt", ".ckpt":
 		return true
 	default:
 		return false

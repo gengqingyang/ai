@@ -24,6 +24,9 @@ make run
 | `/repos` | 列出已添加仓库和当前仓库 |
 | `/repo use <名称>` | 切换当前代码仓库 |
 | `/repo reindex` | 增量更新当前仓库索引 |
+| `/approvals` | 列出还没了结的变更提案，含重启前挂起的那些 |
+| `/approvals approve <ID>` | 批准并执行，然后接着跑完被挂起的那一轮诊断 |
+| `/approvals reject <ID> [理由]` | 驳回，并把理由交回模型 |
 | `/history` | 回看当前会话的对话历史 |
 | `/reset` | 清空当前会话的内存及本地历史 |
 | `/help` | 帮助 |
@@ -112,7 +115,7 @@ Agent 注册了五个使用固定命令模板的节点采证工具：
 
 代码问答提供 `list_files`、`search_code`、`read_file`、`find_symbol`、`find_references`、`get_definition` 和 `get_repository_revision` 七个只读工具。文件访问通过 Eino filesystem 协议的 `LocalRepoBackend`，写入和编辑固定拒绝，也不提供 Shell。Go 文件建立 AST 定义、引用和调用位置索引，其他 UTF-8 文本使用逐行检索。
 
-安全扫描默认排除 `.git`、`.env`、私钥、日志、聊天历史及其会话目录、`.repositories.json`、`.approvals.json`、二进制、生成目录、软链接和超过 2MB 的文件。工具只接受当前仓库内已进入索引的相对路径，越界路径和被排除文件无法读取。仓库目录只持久化规范根路径、Git commit、索引版本和更新时间，不保存源码正文。
+安全扫描默认排除 `.git`、`.env`、私钥、日志、聊天历史及其会话目录、`.repositories.json`、`.approvals.json`、中断快照目录 `.checkpoints` 及 `.ckpt` 文件、二进制、生成目录、软链接和超过 2MB 的文件。工具只接受当前仓库内已进入索引的相对路径，越界路径和被排除文件无法读取。仓库目录只持久化规范根路径、Git commit、索引版本和更新时间，不保存源码正文。
 
 入口使用 `compose.Graph` 把分类结果路由到装机、流量、插件、内核、配网、代码问答、澄清或其他分支。五类诊断各有独立 prompt；工具注册表同时记录风险和业务域，每个分支只绑定自己的工具白名单。纯代码分支只挂载上述七个工具，看不到 Tunnel 和设备工具。
 
@@ -177,6 +180,7 @@ ENV_FILE=/path/to/prod.env go run ./cmd/chat   # 指定别的配置文件
 | `AGENT_HISTORY_FILE` | `.chat_history.json` | 多会话索引；历史正文存入相邻的 `.chat_history_sessions/` |
 | `AGENT_REPOSITORY_FILE` | `.repositories.json` | 命名代码仓库目录；只保存路径和索引元数据，不保存源码 |
 | `AGENT_APPROVAL_FILE` | `.approvals.json` | 提案、原始参数、决定、执行权和结果的持久化状态文件 |
+| `AGENT_CHECKPOINT_DIR` | `.checkpoints` | 中断快照目录（`0700`/`0600`），保存等待审核时那一轮的执行上下文；留空表示不落盘，中断无法跨重启恢复 |
 | `AGENT_IMAGE_MAX_BYTES` | `20971520` | 单张本地图片最大字节数（默认 20MB） |
 | `AGENT_IMAGE_DETAIL` | `auto` | 图片理解精度：`auto` / `low` / `high` |
 | `TOOL_TIMEOUT` | `60s` | 单次工具执行超时（写 `60` 按秒算）；不含等人审核的时间 |
@@ -206,11 +210,32 @@ ENV_FILE=/path/to/prod.env go run ./cmd/chat   # 指定别的配置文件
 - 批准时回放的是提案里存的**原始参数**，不做任何二次加工：审核人看到的和实际执行的必须是同一个东西。
 - 状态机 `pending → approved → executing → executed/failed/unknown`（或 `pending → rejected`）带前置状态校验。进入 `executing` 必须先原子持久化抢占执行权，只有抢占成功的调用才可触发真实工具。
 - `AGENT_APPROVAL_FILE` 使用版本化 JSON、`0600` 权限和原子替换保存提案、原始参数、幂等键及 checkpoint/interrupt 关联。替换前写盘失败会回滚内存；替换后目录同步失败会保留更严格的新状态并阻止后续动作，避免执行权退回。重启后待审和已批准提案仍可查询。
+- 配了 `AGENT_CHECKPOINT_DIR` 时，等人确认的那段时间不占调用栈：变更工具把本轮挂成 Eino 中断并把执行上下文落盘，决定取得后再恢复同一轮，详见下面的「暂停与恢复」。
 - 若进程在取得执行权后、结果落盘前退出，启动恢复会把 `executing` 保守转换为 `unknown`。此状态表示命令可能已经生效，是不可自动重试的终态；恢复调用也不能修改原审核人或原始参数。
 - 每次状态流转追加一行 JSON 到 `AUDIT_LOG`，含提案 ID、工具、完整参数、审核人、时间、执行结果。
 - **失败方向朝安全那边倒**：审核环节报错、Ctrl-C 中断或 Bubble Tea 界面关闭，全部当作「未批准」。`ui.Approver` 不读取 stdin，而是把提案送进根 Model 后同步等待明确决定；没有收到 UI 回传就绝不执行。
 
-不配 `Approver` 时闸门退回异步模式：只登记并持久化提案、返回 `pending_approval`，等外部管理程序调用 `Execute`/`Reject`。当前项目侧状态和执行权已经可恢复；Eino `StatefulInterrupt`、checkpoint store 和 Runner Resume 尚未接入。
+### 暂停与恢复
+
+「等人点头」不再要求进程一直活着。`GatedTool` 登记提案后把本轮挂成 Eino `StatefulInterrupt`，Runner 把这一轮的执行上下文写进 `AGENT_CHECKPOINT_DIR`；`proposal_id`、`checkpoint_id`、`interrupt_id` 和挂起时所在的诊断分支一起存进提案状态文件——光有快照不知道该交给哪个分支跑。
+
+```
+模型这一轮 ──> GatedTool 登记提案 ──> 挂起 + 落快照
+                                        │
+                      进程可以在这里退出 │
+                                        ↓
+重启 ──> /approvals 看到带 * 的提案 ──> approve / reject 先原子落盘
+                                        ↓
+                  按提案记录的分支重建 Runner，Resume 同一份快照
+                                        ↓
+        被唤醒的变更工具回 Store 读决定和原始参数 ──> 真实输出 / 驳回理由
+```
+
+顺序是刻意的，也是这条链路的安全前提：**决定先落盘，再恢复**。恢复通道（`ResumeParams.Targets`）的值一律为 `nil`，不携带任何决定；被唤醒的工具回 `approval.Store` 读状态和原始参数。因此模型和恢复入口都无法从这条路径影响要不要在设备上动手，中途崩溃也不会把已经做出的批准弄丢——快照只表示「流程停在哪」，不表示「批没批」。同理，对还没有决定的提案调用恢复是安全的：工具会原样再挂起一次。
+
+快照目录 `0700`、文件 `0600` 原子替换；`checkpoint_id` 只允许字母、数字、`-` 和 `_`，作为文件名 fail-closed。那一轮跑完或出错后，快照连同提案上的关联一起删除——它含本轮完整模型消息（可能包括截图 base64），没有待恢复的中断就不该继续留在盘上。`/approvals` 同时列出待审提案和「决定已落盘但那一轮还没接回来」的提案，后者正是重启后最容易丢的东西。
+
+`AGENT_CHECKPOINT_DIR` 留空则退回同步审核：审批流程不变，但等待期间进程不能退出。不配 `Approver` 时闸门退回异步模式：只登记并持久化提案、返回 `pending_approval`，等外部管理程序调用 `Execute`/`Reject`；快照会保留，事后仍可接着跑完那一轮。
 
 ### 风险等级
 
@@ -262,6 +287,7 @@ internal/
   application/run.go      配置、模型、工具、会话和 UI 的启动装配
   chat/chat.go            无终端依赖的对话/会话业务
   chat/image.go           图片命令解析 + 本地/远程图片多模态消息
+  chat/approvals.go       /approvals 命令：落决定并接续被挂起的那一轮
   ui/model.go             根 Model 状态与 Init
   ui/banner.go            结构化启动信息的展示文案
   ui/update.go            根 Model 的事件和按键路由
@@ -270,6 +296,7 @@ internal/
   ui/approver.go          Gate 与 Bubble Tea 的审批消息桥
   ui/approval_update.go   根 Model 的审批状态更新
   ui/approval_view.go     审批卡内容渲染
+  ui/approvals.go         /approvals 的列表渲染与恢复期流式输出
   ui/sessions.go          会话选择 UI
   ui/events.go            后台事件定义与消息通道
   ui/error_model.go       独立启动错误 Model
@@ -284,8 +311,10 @@ internal/
   skills/skills.go        只读本地 Skill 后端 + frontmatter 校验 + middleware 构造
   agent/agent.go          ADK ChatModelAgent 组装 + Skill handler + ADK 事件流消费
   agent/prompt.go         system prompt
+  agent/pause.go          中断挂起、决定回查与挂起轮次的恢复
   approval/proposal.go    提案定义与状态常量
   approval/store.go       审核状态机 + JSONL 审计日志
+  approval/checkpoint.go  Eino 中断快照的落盘存储（0700/0600、原子替换）
   tools/registry.go       工具注册表（风险分级，强制变更工具过闸门）
   tools/evidence.go       五类结构化只读采证工具及 Tunnel runner
   tools/evidence_commands.go 固定只读命令模板
@@ -339,7 +368,7 @@ test/                     全部 Go 测试用例（统一 package test）
 go test ./...
 ```
 
-`test/intent_test.go` 覆盖强制结构化工具调用、稳定枚举校验、代码/装机路由、低置信度澄清、上下文限制和图片保留。`test/repository_test.go` 覆盖 AST 定义/引用、精确行号、增量重索引、版本过期、Eino 只读 Backend、路径穿越、密钥和软链接隔离；`test/code_tools_test.go` 覆盖七个代码工具的 Schema、结构化输出和只读注册。`test/evidence_tools_test.go` 使用 fake runner 覆盖五类节点采证。UI、审批和工具测试继续覆盖 Bubble Tea 命令入口、Unicode 输入、会话、人工确认和变更工具强制包装。自动化测试不会连接真实模型或节点。
+`test/intent_test.go` 覆盖强制结构化工具调用、稳定枚举校验、代码/装机路由、低置信度澄清、上下文限制和图片保留。`test/repository_test.go` 覆盖 AST 定义/引用、精确行号、增量重索引、版本过期、Eino 只读 Backend、路径穿越、密钥和软链接隔离；`test/code_tools_test.go` 覆盖七个代码工具的 Schema、结构化输出和只读注册。`test/evidence_tools_test.go` 使用 fake runner 覆盖五类节点采证。`test/approval_checkpoint_test.go` 覆盖快照的原子读写、删除、ID 字符集与目录权限；`test/tools_durable_approval_test.go` 覆盖问人之前先挂起、批准后带真实结果恢复、驳回理由回喂、审核报错按驳回处理、跨重启恢复同一轮和同一提案最多下发一次。UI、审批和工具测试继续覆盖 Bubble Tea 命令入口、Unicode 输入、会话、人工确认和变更工具强制包装。自动化测试不会连接真实模型或节点。
 
 需要检查并发问题时运行 `go test -race ./test`。
 
@@ -351,7 +380,7 @@ go test ./...
 
 完整范围、优先级与验收标准见 [`docs/requirements.md`](docs/requirements.md)。当前路线：
 
-1. **Eino 审批暂停与恢复** —— 提案持久化和原子执行权已完成；下一阶段接入 `StatefulInterrupt`、持久化 checkpoint store 和 Runner Resume，通过 `proposal_id` 回查原始参数与决定。
+1. **外部审核鉴权** —— 提案持久化、原子执行权、`StatefulInterrupt` 暂停与 Runner Resume 均已完成；剩下的是给外部审核入口做身份校验，当前决定人直接取自 `OPERATOR`。
 2. **真实异常诊断** —— 基于后续上传的真实装机异常及其他故障材料迭代诊断链路。
 3. **质量与可观测性** —— 保留单元测试和静态检查，并记录分类、检索、模型和工具阶段指标。
 

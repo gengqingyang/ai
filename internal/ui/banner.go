@@ -21,6 +21,8 @@ type StartupInfo struct {
 	SessionID   string
 	Messages    int
 	Tokens      int
+	// PendingApprovals 是上次退出时还没了结的变更提案数量。
+	PendingApprovals int
 }
 
 // StartupBanner 生成启动时显示的摘要。
@@ -37,7 +39,13 @@ func StartupBanner(info StartupInfo) string {
 	if len(info.Skills) > 0 {
 		loadedSkills = strings.Join(info.Skills, ", ")
 	}
-	return fmt.Sprintf("配置: %s\n工具: %s\nSkill: %s\n当前会话: %s [%s]，已加载 %d 条消息，约 %d tokens",
+	banner := fmt.Sprintf("配置: %s\n工具: %s\nSkill: %s\n当前会话: %s [%s]，已加载 %d 条消息，约 %d tokens",
 		info.Config, strings.Join(toolNames, ", "), loadedSkills,
 		info.SessionName, info.SessionID, info.Messages, info.Tokens)
+	if info.PendingApprovals > 0 {
+		// 上次退出时还挂着的东西必须一进门就说，不能等人自己想起来去查：
+		// 没人处理的提案意味着有一轮诊断停在半路，设备上的问题还在。
+		banner += fmt.Sprintf("\n有 %d 条变更提案尚未了结，输入 /approvals 处理。", info.PendingApprovals)
+	}
+	return banner
 }

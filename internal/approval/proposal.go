@@ -45,9 +45,12 @@ type Proposal struct {
 	// IdempotencyKey 是提案级稳定幂等键。它随原始参数持久化，用于审计和后续
 	// checkpoint 关联；真正的最多下发一次由 executing 状态的原子抢占保证。
 	IdempotencyKey string `json:"idempotency_key"`
-	// CheckpointID 和 InterruptID 预留给 Eino 暂停/恢复流程，必须与提案一起保存。
+	// CheckpointID 和 InterruptID 把提案钉在 Eino 的暂停点上，必须与提案一起保存。
+	// Flow 记录挂起时所在的诊断分支——重启后要按同一个分支重建 Runner 才能恢复
+	// 那一轮，光有快照不知道该交给谁跑。三者要么都为空，要么同时存在。
 	CheckpointID string `json:"checkpoint_id,omitempty"`
 	InterruptID  string `json:"interrupt_id,omitempty"`
+	Flow         string `json:"flow,omitempty"`
 
 	Status    Status    `json:"status"`
 	CreatedAt time.Time `json:"created_at"`

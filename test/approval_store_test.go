@@ -454,19 +454,47 @@ func TestPersistentStoreBindsInterruptOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	first := InterruptBinding{
+		CheckpointID: "checkpoint-1", InterruptID: "interrupt-1", Flow: "plugin",
+	}
 	p := createProposal(t, s, "run_tunnel_cmd", "{}")
-	bound, err := s.BindInterrupt(p.ID, "checkpoint-1", "interrupt-1")
+	bound, err := s.BindInterrupt(p.ID, first)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bound.CheckpointID != "checkpoint-1" || bound.InterruptID != "interrupt-1" {
-		t.Fatalf("中断关联=%#v", bound)
+	if bound.Binding() != first {
+		t.Fatalf("中断关联=%#v", bound.Binding())
 	}
-	if _, err := s.BindInterrupt(p.ID, "checkpoint-1", "interrupt-1"); err != nil {
+	if !bound.Resumable() {
+		t.Fatal("绑定后的待审提案应可恢复")
+	}
+	if _, err := s.BindInterrupt(p.ID, first); err != nil {
 		t.Fatalf("相同关联的幂等写入失败: %v", err)
 	}
-	if _, err := s.BindInterrupt(p.ID, "checkpoint-2", "interrupt-2"); err == nil {
-		t.Fatal("已有中断关联被替换")
+	// 三个字段各自都足以指向另一轮执行，改动任何一个都必须被挡下：放行等于
+	// 承认同一条提案有两条下发路径。
+	for _, other := range []InterruptBinding{
+		{CheckpointID: "checkpoint-2", InterruptID: "interrupt-1", Flow: "plugin"},
+		{CheckpointID: "checkpoint-1", InterruptID: "interrupt-2", Flow: "plugin"},
+		{CheckpointID: "checkpoint-1", InterruptID: "interrupt-1", Flow: "kernel"},
+	} {
+		if _, err := s.BindInterrupt(p.ID, other); err == nil {
+			t.Fatalf("已有中断关联被 %#v 替换", other)
+		}
+	}
+	// 缺任何一件线索都恢复不了，半截关联不能落盘。
+	for _, incomplete := range []InterruptBinding{
+		{InterruptID: "interrupt-9", Flow: "plugin"},
+		{CheckpointID: "checkpoint-9", Flow: "plugin"},
+		{CheckpointID: "checkpoint-9", InterruptID: "interrupt-9"},
+	} {
+		fresh := createProposal(t, s, "run_tunnel_cmd", "{}")
+		if _, err := s.BindInterrupt(fresh.ID, incomplete); err == nil {
+			t.Fatalf("残缺关联 %#v 被接受", incomplete)
+		}
+		if stored, _ := s.Get(fresh.ID); stored.Binding() != (InterruptBinding{}) {
+			t.Fatalf("残缺关联被写入: %#v", stored.Binding())
+		}
 	}
 
 	reopened, err := OpenStore(WithStateFile(path), WithClock(fixedClock()))
@@ -474,8 +502,11 @@ func TestPersistentStoreBindsInterruptOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	restored, _ := reopened.Get(p.ID)
-	if restored.CheckpointID != "checkpoint-1" || restored.InterruptID != "interrupt-1" {
-		t.Fatalf("重启后中断关联=%#v", restored)
+	if restored.Binding() != first {
+		t.Fatalf("重启后中断关联=%#v", restored.Binding())
+	}
+	if !restored.Resumable() {
+		t.Fatal("重启后提案应仍可恢复")
 	}
 }
 
@@ -646,4 +677,92 @@ func readAudit(t *testing.T, path string) ([]string, []string) {
 		t.Fatalf("读审计日志失败: %v", err)
 	}
 	return events, lines
+}
+
+// 同一条提案会被多路推进：审批卡、外部管理程序、恢复流程都可能同时动它。
+// 状态机本身用互斥保证「只有一个赢」，这里额外盯住被拒的那一路——被拒时要报告
+// 的状态必须在持锁期间就抄走。晚一步去读，读到的既不是拒绝时的状态，还会和正
+// 在推进生命周期的那一路撞上。
+//
+// 因此这里先把提案批掉，让所有并发调用都注定失败（它们都要求 pending），再让
+// 一路继续走 approved→executing→executed 不断改写状态。失败的那几路一直空转到
+// 改写结束为止，好让「失败路径读状态」稳定地压在「成功路径写状态」上。
+func TestConcurrentTransitionsAreRaceFree(t *testing.T) {
+	s, err := OpenStore(WithStateFile(filepath.Join(t.TempDir(), "approvals.json")))
+	if err != nil {
+		t.Fatalf("OpenStore() error = %v", err)
+	}
+
+	// 多跑几轮：每轮的写入窗口只有两次状态转移，轮数是用来换命中率的。
+	for round := range 5 {
+		p := createProposal(t, s, "restart_plugin", `{"sn":"SN001"}`)
+		if _, err := s.Approve(p.ID, "alice"); err != nil {
+			t.Fatalf("第 %d 轮 Approve() error = %v", round, err)
+		}
+
+		var wg sync.WaitGroup
+		done := make(chan struct{})
+		lifecycleErr := make(chan error, 1)
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer close(done)
+			if _, err := s.ClaimExecution(p.ID); err != nil {
+				lifecycleErr <- err
+				return
+			}
+			_, err := s.MarkExecuted(p.ID, "restarted", nil)
+			lifecycleErr <- err
+		}()
+
+		const losers = 6
+		for i := range losers {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				for {
+					select {
+					case <-done:
+						return
+					default:
+					}
+					// 返回值一律丢弃：这些调用都要求 pending，注定失败；此处只
+					// 关心失败路径有没有在解锁之后才去读提案。
+					switch i % 3 {
+					case 0:
+						_, _ = s.Approve(p.ID, "carol")
+					case 1:
+						_, _ = s.Reject(p.ID, "bob", "线上高峰期")
+					default:
+						_, _ = s.BindInterrupt(p.ID, InterruptBinding{
+							CheckpointID: "run-race", InterruptID: "interrupt-race", Flow: "plugin",
+						})
+					}
+				}
+			}(i)
+		}
+		wg.Wait()
+
+		if err := <-lifecycleErr; err != nil {
+			t.Fatalf("第 %d 轮生命周期被并发调用打断: %v", round, err)
+		}
+		final, ok := s.Get(p.ID)
+		if !ok {
+			t.Fatalf("提案 %s 消失了", p.ID)
+		}
+		if final.Status != StatusExecuted {
+			t.Errorf("状态 = %s, want executed", final.Status)
+		}
+		if final.Decider != "alice" {
+			t.Errorf("决策人 = %q, want alice；并发的失败调用不该改写它", final.Decider)
+		}
+		if final.RejectReason != "" {
+			t.Errorf("已执行的提案带上了驳回理由: %q", final.RejectReason)
+		}
+		if final.CheckpointID != "" || final.InterruptID != "" {
+			t.Errorf("非 pending 的提案被绑上了中断: checkpoint=%q interrupt=%q",
+				final.CheckpointID, final.InterruptID)
+		}
+	}
 }

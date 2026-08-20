@@ -28,10 +28,35 @@ type Agent struct {
 	evidence   *EvidencePipeline
 	baseModel  model.ToolCallingChatModel
 	skillNames []string
+
+	// checkpoints 和 pauses 同时非空时，变更工具的人工确认走 Eino 中断：
+	// 等待期间本轮上下文落盘，进程退出后仍可恢复。见 run。
+	checkpoints adk.CheckPointStore
+	pauses      tools.PauseResolver
+}
+
+// Option 是 Agent 的可选装配项。
+type Option func(*Agent)
+
+// WithDurablePause 打开「中断式人工审核」：变更工具挂起本轮并落成快照，
+// 由 run 循环取得人工决定后再让 Runner 恢复。
+//
+// 两个参数缺一不可，缺任何一个都退回同步审核（等待期间不可恢复）。
+func WithDurablePause(store adk.CheckPointStore, resolver tools.PauseResolver) Option {
+	return func(a *Agent) {
+		a.checkpoints = store
+		a.pauses = resolver
+	}
 }
 
 // New 构造分类路由 Graph 和带独立 prompt、工具白名单的故障子流程。
-func New(ctx context.Context, cm model.ToolCallingChatModel, reg *tools.Registry, cfg *config.Config) (*Agent, error) {
+func New(
+	ctx context.Context,
+	cm model.ToolCallingChatModel,
+	reg *tools.Registry,
+	cfg *config.Config,
+	opts ...Option,
+) (*Agent, error) {
 	classifier, err := intent.New(cm)
 	if err != nil {
 		return nil, fmt.Errorf("创建意图分类器失败: %w", err)
@@ -71,13 +96,17 @@ func New(ctx context.Context, cm model.ToolCallingChatModel, reg *tools.Registry
 	for _, matter := range skillMatters {
 		skillNames = append(skillNames, matter.Name)
 	}
-	return &Agent{
+	a := &Agent{
 		flows:      flows,
 		router:     router,
 		evidence:   evidence,
 		baseModel:  cm,
 		skillNames: skillNames,
-	}, nil
+	}
+	for _, opt := range opts {
+		opt(a)
+	}
+	return a, nil
 }
 
 func toolsForFlow(reg *tools.Registry, spec flowSpec) ([]tool.BaseTool, error) {
@@ -261,6 +290,10 @@ func (a *Agent) withEvidence(ctx context.Context, msgs []*schema.Message, route 
 // run consumes ADK events and returns the last assistant message without tool
 // calls. ADK emits every model turn, so intermediate explanations can be
 // streamed before an approval prompt while only the final answer enters history.
+//
+// 开启中断式审核后，本轮可能被变更工具挂起若干次：每次挂起都把执行上下文落成
+// 快照，取得人工决定并持久化之后再恢复同一轮。对用户来说顺序不变——审批卡仍
+// 出现在模型这一轮之内，模型拿到的仍是真实执行结果或驳回理由。
 func (a *Agent) run(
 	ctx context.Context,
 	msgs []*schema.Message,
@@ -274,25 +307,110 @@ func (a *Agent) run(
 	if !ok || selected == nil {
 		return nil, fmt.Errorf("诊断分支 %q 未初始化", flow)
 	}
-	runner := adk.NewRunner(ctx, adk.RunnerConfig{
-		Agent:           selected,
-		EnableStreaming: stream,
-	})
-	iter := runner.Run(ctx, msgs)
 
-	var final *schema.Message
-	answerSegments := 0
-	reasoningSegments := 0
+	cfg := adk.RunnerConfig{Agent: selected, EnableStreaming: stream}
+	turn := &turnRunner{flow: flow, durable: a.checkpoints != nil && a.pauses != nil}
+	if turn.durable {
+		id, err := newCheckpointID()
+		if err != nil {
+			return nil, err
+		}
+		turn.checkpointID = id
+		cfg.CheckPointStore = a.checkpoints
+		turn.runOpts = append(turn.runOpts, adk.WithCheckPointID(id))
+	}
+
+	turn.runner = adk.NewRunner(ctx, cfg)
+	iter := turn.runner.Run(ctx, msgs, turn.runOpts...)
+	return a.pump(ctx, turn, iter, &runState{}, onProgress, onReasoning, onChunk)
+}
+
+// turnRunner 记住一轮执行的恢复条件：用哪个 Runner、哪份快照、哪个分支。
+// 首次执行和重启后的恢复共用它，好让两条路径的挂起处理完全一致。
+type turnRunner struct {
+	runner       *adk.Runner
+	checkpointID string
+	flow         Flow
+	durable      bool
+	runOpts      []adk.AgentRunOption
+}
+
+// pump 反复消费事件流，遇到挂起就取得人工决定再恢复，直到本轮跑完或停在待审上。
+func (a *Agent) pump(
+	ctx context.Context,
+	turn *turnRunner,
+	iter *adk.AsyncIterator[*adk.AgentEvent],
+	st *runState,
+	onProgress func(string),
+	onReasoning func(string),
+	onChunk func(string),
+) (*schema.Message, error) {
+	for {
+		pending, err := a.consume(iter, st, onProgress, onReasoning, onChunk)
+		if err != nil {
+			a.discardCheckpoint(ctx, turn.checkpointID)
+			return st.final, err
+		}
+		if len(pending) == 0 {
+			a.discardCheckpoint(ctx, turn.checkpointID)
+			return st.final, nil
+		}
+		if !turn.durable {
+			// 没开中断式审核却收到了中断，说明装配不一致。这时候放行等于把
+			// 「人还没点头」当成完成，必须显式失败。
+			a.discardCheckpoint(ctx, turn.checkpointID)
+			return st.final, errors.New("本轮被挂起等待人工确认，但当前未启用中断恢复，操作未执行")
+		}
+
+		targets, err := a.resolvePauses(ctx, turn.checkpointID, turn.flow, pending, onProgress)
+		if err != nil {
+			return st.final, err
+		}
+		if len(targets) == 0 {
+			// 提案已登记但还没有决定（异步模式）。保留快照，等外部审核后恢复。
+			return st.final, nil
+		}
+		iter, err = turn.runner.ResumeWithParams(ctx, turn.checkpointID,
+			&adk.ResumeParams{Targets: targets}, turn.runOpts...)
+		if err != nil {
+			return st.final, fmt.Errorf("恢复被审核挂起的执行失败: %w", err)
+		}
+	}
+}
+
+// runState 跨越「挂起 → 恢复」在同一轮里累积输出，保证分段编号连续。
+type runState struct {
+	final             *schema.Message
+	answerSegments    int
+	reasoningSegments int
+}
+
+// consume 消费一段事件流，返回本段收集到的根因中断点（没有则为空）。
+func (a *Agent) consume(
+	iter *adk.AsyncIterator[*adk.AgentEvent],
+	st *runState,
+	onProgress func(string),
+	onReasoning func(string),
+	onChunk func(string),
+) ([]*adk.InterruptCtx, error) {
+	var pending []*adk.InterruptCtx
 	for {
 		event, ok := iter.Next()
 		if !ok {
-			return final, nil
+			return pending, nil
 		}
 		if event == nil {
 			continue
 		}
 		if event.Err != nil {
-			return final, event.Err
+			return nil, event.Err
+		}
+		if event.Action != nil && event.Action.Interrupted != nil {
+			for _, ic := range event.Action.Interrupted.InterruptContexts {
+				if ic != nil && ic.IsRootCause {
+					pending = append(pending, ic)
+				}
+			}
 		}
 		if event.Output == nil || event.Output.MessageOutput == nil {
 			continue
@@ -311,16 +429,16 @@ func (a *Agent) run(
 		}
 
 		msg, err := consumeMessageOutput(
-			output, onReasoning, onChunk, &reasoningSegments, &answerSegments,
+			output, onReasoning, onChunk, &st.reasoningSegments, &st.answerSegments,
 		)
 		if err != nil {
-			return final, err
+			return nil, err
 		}
 		if msg != nil && len(msg.ToolCalls) > 0 {
 			notifyProgress(onProgress, "调用工具："+toolCallNames(msg.ToolCalls))
 		}
 		if msg != nil && len(msg.ToolCalls) == 0 {
-			final = msg
+			st.final = msg
 		}
 	}
 }

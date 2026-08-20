@@ -111,6 +111,8 @@ func TestRepositoryExcludesSecretsBinaryLogsGeneratedAndSymlinks(t *testing.T) {
 	writeTestFile(t, filepath.Join(root, ".repositories.json"), "repository state\n")
 	writeTestFile(t, filepath.Join(root, ".approvals.json"), "approval state\n")
 	writeTestFile(t, filepath.Join(root, ".chat_history_sessions", "private.json"), "private chat\n")
+	writeTestFile(t, filepath.Join(root, ".checkpoints", "run-abc.ckpt"), "paused turn context\n")
+	writeTestFile(t, filepath.Join(root, "snapshots", "run-def.ckpt"), "paused turn context\n")
 	writeTestFile(t, filepath.Join(root, "private.txt"), "-----BEGIN PRIVATE KEY-----\nsecret\n")
 	writeTestFile(t, filepath.Join(root, "blob.bin"), string([]byte{0, 1, 2, 3}))
 	writeTestFile(t, filepath.Join(root, "node_modules", "generated.js"), "generated\n")
@@ -134,6 +136,7 @@ func TestRepositoryExcludesSecretsBinaryLogsGeneratedAndSymlinks(t *testing.T) {
 	for _, excluded := range []string{
 		".env", "diagnostic.log", ".repositories.json", ".approvals.json", "private.json",
 		"private.txt", "blob.bin", "generated.js", "outside-link.txt",
+		"run-abc.ckpt", "run-def.ckpt",
 	} {
 		if strings.Contains(joined, excluded) {
 			t.Errorf("安全索引包含了 %q: %v", excluded, paths)

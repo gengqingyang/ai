@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"encoding/gob"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,10 +12,17 @@ import (
 	"time"
 
 	"github.com/cloudwego/eino/components/tool"
+	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
 
 	"diagnostic-system/internal/approval"
 )
+
+func init() {
+	// PauseInfo 会随中断信号一起进入 checkpoint 的 gob 流，而它挂在 `any` 字段上，
+	// 不注册的话编码阶段就会失败——那等于每次要人确认时都写不出快照。
+	gob.Register(PauseInfo{})
+}
 
 // Decision 是人工审核的结果。
 type Decision struct {
@@ -49,6 +57,36 @@ type Noticer interface {
 // 「不知道跑没跑成」，命令可能还在节点上继续执行，这话得跟人说清楚。
 var ErrToolTimeout = errors.New("调用超时")
 
+// PauseInfo 是变更工具中断时抛给上层的说明，用来找到对应提案并弹审批卡。
+//
+// 它只是「界面上要显示什么」，不承载任何决定：Eino 不会持久化恢复语义，
+// 批准与否、审核人和原始参数一律回 approval.Store 查。字段全部导出且都是
+// 基础类型，因为这个结构会随中断信号进入 checkpoint 的 gob 流。
+type PauseInfo struct {
+	// ProposalID 是回查提案的唯一凭据。
+	ProposalID string
+	// Tool 是被拦下的变更工具名。
+	Tool string
+	// Args 是模型传入的原始参数，原样展示给审核人。
+	Args string
+	// RiskLevel 和 RiskReason 是启发式风险提示，仅供参考。
+	RiskLevel  string
+	RiskReason string
+}
+
+// PauseResolver 是「把挂起的变更提案推进到有决定」的能力。
+//
+// internal/agent 只依赖这个接口，不依赖具体的 Gate：run 循环拿到中断后
+// 先绑定 checkpoint，再取人工决定，然后才让 Runner 恢复。
+type PauseResolver interface {
+	// BindPause 持久化提案与它所处暂停点的关联（checkpoint、interrupt、flow）。
+	BindPause(proposalID string, binding approval.InterruptBinding) error
+	// Resolve 取得并持久化人工决定，返回决定之后的提案。
+	Resolve(ctx context.Context, proposalID string) (*approval.Proposal, error)
+	// ReleasePauses 抹掉指向某份快照的关联，在快照被清理时调用。
+	ReleasePauses(checkpointID string) error
+}
+
 // Gate 是变更类工具的人工审核闸门。
 //
 // 变更工具经 Wrap 包装后交给模型。模型调用它时，Gate 先登记一条提案，
@@ -60,12 +98,17 @@ var ErrToolTimeout = errors.New("调用超时")
 // 没有配置 Approver 时退化成异步模式：只登记提案就返回，等外部调用
 // Execute/Reject（外部管理程序或值班同事事后处理等场景）。
 //
+// 开启 WithDurablePause 后，「等人」这段时间不再占着调用栈，而是把本轮挂成
+// Eino 中断并落盘；决定由 agent 层取得后再恢复。人看到的顺序不变，但等待期间
+// 进程可以退出。
+//
 // 无论哪种模式，模型手上那个工具都没有执行能力——真实实现只存在于
 // Gate.inner 里。这是结构上的隔离，不是靠 prompt 约束模型「不要执行」。
 type Gate struct {
-	store    *approval.Store
-	approver Approver
-	timeout  time.Duration
+	store        *approval.Store
+	approver     Approver
+	timeout      time.Duration
+	durablePause bool
 
 	mu    sync.RWMutex
 	inner map[string]tool.InvokableTool
@@ -77,6 +120,18 @@ type GateOption func(*Gate)
 // WithApprover 配置人工审核入口，开启「当场确认、当场执行」模式。
 func WithApprover(a Approver) GateOption {
 	return func(g *Gate) { g.approver = a }
+}
+
+// WithDurablePause 让变更工具用 Eino 中断挂起本轮，而不是在调用栈里干等人。
+//
+// 开启后等待确认的那段时间会落成 checkpoint：进程这时候退出，重启后仍能凭
+// proposal_id 找回这一轮的执行上下文接着跑完，而不是让模型从头再想一遍。
+// 对用户来说观感不变——审批卡依然出现在模型这一轮之内，恢复也在同一轮完成。
+//
+// 只在同时配了 Approver 和 checkpoint store 时打开：没有审核入口时，闸门要
+// 保持「登记提案后立刻返回 pending_approval」的异步语义，挂起就没人来解了。
+func WithDurablePause() GateOption {
+	return func(g *Gate) { g.durablePause = true }
 }
 
 // WithTimeout 限制单次工具执行的时长，0 或负数表示不限。
@@ -286,6 +341,66 @@ func (g *Gate) Reject(id, decider, reason string) (*approval.Proposal, error) {
 // Store 暴露底层存储，供上层查询待审列表。
 func (g *Gate) Store() *approval.Store { return g.store }
 
+// 编译期确认 Gate 满足挂起解析协议。
+var _ PauseResolver = (*Gate)(nil)
+
+// BindPause 把待审提案和它所处的中断点关联起来并落盘。
+//
+// 必须在请人确认之前完成：人已经点了「执行」但关联还没写下去时进程退出，
+// 重启后就找不到该恢复哪一轮了。
+func (g *Gate) BindPause(proposalID string, binding approval.InterruptBinding) error {
+	_, err := g.store.BindInterrupt(proposalID, binding)
+	return err
+}
+
+// ReleasePauses 在一份快照被清理时，抹掉指向它的全部暂停点关联。
+//
+// 和 BindPause 成对：关联存在就代表「那一轮还挂着、还能接」。快照都没了还留着
+// 关联，只会让审批入口列出一条点不动的提案。
+func (g *Gate) ReleasePauses(checkpointID string) error {
+	return g.store.ClearInterrupts(checkpointID)
+}
+
+// Resolve 为一条挂起的提案取得人工决定，并在恢复流程之前先把决定持久化。
+//
+// 顺序是刻意的：先原子写下 approved/rejected，再让 Runner 恢复。中间崩溃时
+// 决定不会丢，恢复后的工具直接从 Store 读它，而不是重新问一遍人。
+//
+// 已经有决定的提案（重启前批过、或外部程序处理过）原样返回，不会二次征询。
+// 取不到决定一律按驳回处理——拿不到人的确认就绝不动手。
+func (g *Gate) Resolve(ctx context.Context, proposalID string) (*approval.Proposal, error) {
+	p, ok := g.store.Get(proposalID)
+	if !ok {
+		return nil, fmt.Errorf("提案 %s 不存在", proposalID)
+	}
+	if p.Status != approval.StatusPending {
+		return p, nil
+	}
+	if g.approver == nil {
+		// 异步模式：提案留在 pending，等外部管理程序调用 Execute/Reject。
+		return p, nil
+	}
+
+	risk := AssessRisk(p.Tool, p.Args)
+	d, err := g.approver.Review(ctx, p, risk)
+	if err != nil {
+		reason := fmt.Sprintf("未能取得人工确认: %v", err)
+		rejected, rErr := g.Reject(p.ID, "system", reason)
+		if rErr != nil {
+			return nil, fmt.Errorf("%s，且驳回未能落盘: %w", reason, rErr)
+		}
+		return rejected, nil
+	}
+	if !d.Approved {
+		reason := d.Reason
+		if reason == "" {
+			reason = "（未填写理由）"
+		}
+		return g.Reject(p.ID, deciderOr(d.Decider), reason)
+	}
+	return g.store.Approve(p.ID, deciderOr(d.Decider))
+}
+
 // GatedTool 是变更类工具交给模型的门面：它只能发起审核，不能自己执行。
 //
 // 它刻意不持有真实工具的引用——真实实现只在 Gate 里。
@@ -329,7 +444,92 @@ func (r gateResponse) marshal() (string, error) {
 //
 // 这个方法是模型唯一能碰到的入口，它自己没有任何执行路径：真正的调用发生在
 // Gate.Execute 里，而 Execute 只有在 Store.Approve 成功之后才会走到工具。
+//
+// 有两种等人的姿势，对模型完全一样，区别只在「等待期间进程能不能死」：
+//
+//	中断式：把本轮挂起并落成 checkpoint，由 agent 层取决定后恢复（可跨重启）
+//	同步式：在调用栈里直接问 Approver 并等回复（进程退出即丢失）
+//
+// 只有开了 WithDurablePause、配了 Approver 且确实跑在 eino 运行上下文里才走
+// 中断式。缺任何一个条件都退回同步式——在 eino 之外调用 StatefulInterrupt
+// 不会报错，只会安静地变成一个没人处理的工具错误，那才是真的坏。
 func (t *GatedTool) InvokableRun(ctx context.Context, argumentsInJSON string, _ ...tool.Option) (string, error) {
+	if t.gate.durablePause && t.gate.approver != nil && len(compose.GetCurrentAddress(ctx)) > 0 {
+		return t.runInterruptible(ctx, argumentsInJSON)
+	}
+	return t.runSynchronous(ctx, argumentsInJSON)
+}
+
+// runInterruptible 用 Eino 中断把「等人确认」这段时间挂到进程外面去。
+//
+// 同一次工具调用会进来两次以上：第一次登记提案并中断，之后每次恢复都重新
+// 判断该继续挂着、驳回还是执行。判断依据只有 Store 里的提案状态——恢复数据
+// 里不带任何决定，模型和客户端都无法从这条路径影响是否下发。
+func (t *GatedTool) runInterruptible(ctx context.Context, argumentsInJSON string) (string, error) {
+	wasInterrupted, hasState, proposalID := tool.GetInterruptState[string](ctx)
+	if !wasInterrupted {
+		p, err := t.gate.store.Create(t.info.Name, argumentsInJSON)
+		if err != nil {
+			return "", fmt.Errorf("创建变更提案失败，操作未执行: %w", err)
+		}
+		return "", t.pause(ctx, p)
+	}
+	if !hasState || proposalID == "" {
+		// 快照里没有提案号就无从回查决定。这条路径必须失败，绝不能猜。
+		return "", errors.New("恢复变更操作时丢失了提案标识，操作未执行；请重新发起并确认")
+	}
+
+	p, ok := t.gate.store.Get(proposalID)
+	if !ok {
+		return "", fmt.Errorf("恢复变更操作失败：提案 %s 不存在，操作未执行", proposalID)
+	}
+	if p.Tool != t.info.Name {
+		// 快照与工具对不上，说明恢复目标错位了。宁可这轮失败也不能张冠李戴。
+		return "", fmt.Errorf("提案 %s 属于工具 %q，与当前工具 %q 不符，操作未执行",
+			p.ID, p.Tool, t.info.Name)
+	}
+
+	if isTarget, _, _ := tool.GetResumeContext[any](ctx); !isTarget {
+		// 本次恢复冲着别的中断点去的。这里必须原样再中断一次，否则状态就丢了。
+		return "", t.pause(ctx, p)
+	}
+
+	switch p.Status {
+	case approval.StatusPending:
+		// 还没拿到决定就被恢复了（例如上层只解了同批里的另一条），继续挂着。
+		return "", t.pause(ctx, p)
+	case approval.StatusRejected:
+		return rejectedResponse(p, p.RejectReason).marshal()
+	case approval.StatusApproved:
+		return t.execute(ctx, p.ID, p.Decider)
+	case approval.StatusExecuted, approval.StatusFailed, approval.StatusUnknown:
+		// 已经下发过了。重放存下来的结果，不再碰设备——同一提案最多下发一次。
+		return outcomeResponse(p).marshal()
+	case approval.StatusExecuting:
+		return "", fmt.Errorf("提案 %s 正在执行中，不能重复下发", p.ID)
+	default:
+		return "", fmt.Errorf("提案 %s 当前状态 %q 无效", p.ID, p.Status)
+	}
+}
+
+// pause 把当前这轮挂起，并把提案号写进中断状态。
+//
+// 状态里只放提案号：checkpoint 是模型侧数据，不能让它承载「批没批」。
+func (t *GatedTool) pause(ctx context.Context, p *approval.Proposal) error {
+	risk := AssessRisk(p.Tool, p.Args)
+	slog.Info("模型发起变更操作，挂起本轮等待人工确认",
+		"proposal", p.ID, "tool", p.Tool, "risk", risk.Level.String(), "args", p.Args)
+	return tool.StatefulInterrupt(ctx, PauseInfo{
+		ProposalID: p.ID,
+		Tool:       p.Tool,
+		Args:       p.Args,
+		RiskLevel:  risk.Level.String(),
+		RiskReason: risk.Reason,
+	}, p.ID)
+}
+
+// runSynchronous 在调用栈里直接问人并等回复。
+func (t *GatedTool) runSynchronous(ctx context.Context, argumentsInJSON string) (string, error) {
 	p, err := t.gate.store.Create(t.info.Name, argumentsInJSON)
 	if err != nil {
 		return "", fmt.Errorf("创建变更提案失败，操作未执行: %w", err)
@@ -356,13 +556,9 @@ func (t *GatedTool) InvokableRun(ctx context.Context, argumentsInJSON string, _ 
 		if _, rErr := t.gate.Reject(p.ID, "system", reason); rErr != nil {
 			slog.Error("驳回失败", "proposal", p.ID, "err", rErr)
 		}
-		return gateResponse{
-			Status:     "rejected",
-			ProposalID: p.ID,
-			Tool:       p.Tool,
-			Reason:     reason,
-			Message:    "没能拿到人工确认，操作未执行。请告知用户审核环节出了问题。",
-		}.marshal()
+		resp := rejectedResponse(p, reason)
+		resp.Message = "没能拿到人工确认，操作未执行。请告知用户审核环节出了问题。"
+		return resp.marshal()
 	}
 
 	if !d.Approved {
@@ -373,21 +569,36 @@ func (t *GatedTool) InvokableRun(ctx context.Context, argumentsInJSON string, _ 
 		if _, rErr := t.gate.Reject(p.ID, deciderOr(d.Decider), reason); rErr != nil {
 			return "", fmt.Errorf("记录驳回失败: %w", rErr)
 		}
-		return gateResponse{
-			Status:     "rejected",
-			ProposalID: p.ID,
-			Tool:       p.Tool,
-			Reason:     reason,
-			Message: "人工审核未通过，操作没有执行。请根据驳回理由调整方案，" +
-				"不要重复提交同样的操作，也不要假设它以任何形式生效了。",
-		}.marshal()
+		return rejectedResponse(p, reason).marshal()
 	}
 
-	done, err := t.gate.Execute(ctx, p.ID, deciderOr(d.Decider))
+	return t.execute(ctx, p.ID, deciderOr(d.Decider))
+}
+
+// execute 下发并把最终状态翻成模型能直接读的结构。
+func (t *GatedTool) execute(ctx context.Context, proposalID, decider string) (string, error) {
+	done, err := t.gate.Execute(ctx, proposalID, decider)
 	if err != nil && (done == nil || done.Status != approval.StatusUnknown) {
-		return "", fmt.Errorf("执行提案 %s 失败: %w", p.ID, err)
+		return "", fmt.Errorf("执行提案 %s 失败: %w", proposalID, err)
 	}
+	return outcomeResponse(done).marshal()
+}
 
+func rejectedResponse(p *approval.Proposal, reason string) gateResponse {
+	if reason == "" {
+		reason = "（未填写理由）"
+	}
+	return gateResponse{
+		Status:     "rejected",
+		ProposalID: p.ID,
+		Tool:       p.Tool,
+		Reason:     reason,
+		Message: "人工审核未通过，操作没有执行。请根据驳回理由调整方案，" +
+			"不要重复提交同样的操作，也不要假设它以任何形式生效了。",
+	}
+}
+
+func outcomeResponse(done *approval.Proposal) gateResponse {
 	resp := gateResponse{
 		Status:     string(done.Status),
 		ProposalID: done.ID,
@@ -395,16 +606,17 @@ func (t *GatedTool) InvokableRun(ctx context.Context, argumentsInJSON string, _ 
 		Result:     done.Result,
 		Error:      done.Error,
 	}
-	if done.Status == approval.StatusUnknown {
+	switch done.Status {
+	case approval.StatusUnknown:
 		resp.Message = "人工已批准并已下发，但最终结果未知。命令可能已经生效；" +
 			"请如实告知用户并通过只读证据核实，禁止自动重试同一提案。"
-	} else if done.Status == approval.StatusFailed {
+	case approval.StatusFailed:
 		resp.Message = "人工已批准，但执行失败。请依据下面的 error 判断原因，不要臆造输出内容；" +
 			"不要把确定失败说成成功。"
-	} else {
+	default:
 		resp.Message = "人工已批准并执行完毕，下面 result 是设备返回的真实输出。请据此继续分析。"
 	}
-	return resp.marshal()
+	return resp
 }
 
 func deciderOr(name string) string {

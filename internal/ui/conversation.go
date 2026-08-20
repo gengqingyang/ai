@@ -83,6 +83,8 @@ func (m Model) submit(line string) (tea.Model, tea.Cmd) {
 	case "/help":
 		m.appendEntry(roleSystem, helpText())
 		return m, nil
+	case "/approvals":
+		return m.runApprovals(line)
 	default:
 		m.appendEntry(roleError, fmt.Sprintf("未知命令 %s，输入 /help 查看可用命令", fields[0]))
 		return m, nil
@@ -137,8 +139,11 @@ func (m *Model) finishAsk(done askDoneMsg) {
 	m.flushStreaming()
 	if !m.assistantStreamed && done.err == nil && done.reply != "" {
 		m.appendEntry(roleAssistant, done.reply)
-	} else if !m.assistantStreamed && done.err == nil {
+	} else if !m.assistantStreamed && done.err == nil && done.note == "" {
 		m.appendEntry(roleStatus, "模型没有再补充说明。")
+	}
+	if done.note != "" {
+		m.appendEntry(roleStatus, done.note)
 	}
 	if done.err != nil {
 		m.appendEntry(roleError, "本轮失败: "+humanErr(done.err))
@@ -214,7 +219,8 @@ func oneLine(text string) string {
 func helpText() string {
 	return "直接输入问题即可。命令：/sessions 选择会话 | /new [名称] 新建 | " +
 		"/switch ID 切换 | /image <路径或 URL> [问题] | /repos | " +
-		"/repo add|use|reindex | /history | /reset | /help | /exit"
+		"/repo add|use|reindex | /approvals [approve|reject <ID>] | " +
+		"/history | /reset | /help | /exit"
 }
 
 func repositoriesText(items []repository.Info) string {

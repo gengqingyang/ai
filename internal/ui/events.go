@@ -16,6 +16,9 @@ type logMsg struct{ line string }
 type askDoneMsg struct {
 	reply string
 	err   error
+	// note 是一句结果说明，用在本轮除了模型回复之外还有事要交代的时候
+	// （例如审批命令：提案最终落到了哪个状态）。
+	note string
 }
 type contextDoneMsg struct{}
 

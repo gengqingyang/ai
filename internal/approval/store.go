@@ -189,6 +189,23 @@ func (s *Store) All() []*Proposal {
 	return out
 }
 
+// Resumable 报告这条提案背后那一轮诊断是否还能接着跑完。
+//
+// 前提是三件线索齐备——少一件就找不回那一轮。除此之外只排除 executing：那说明
+// 有一路正握着执行权在下发，谁都不许从旁边再进来一次。
+//
+// 其余状态都可以恢复，包括已经有结果的：恢复不等于重新下发。变更工具看到终态
+// 会把存下来的结果原样回放给模型，让这一轮把话说完，而不是碰设备。
+func (p *Proposal) Resumable() bool {
+	return p.Status != StatusExecuting &&
+		InterruptBinding{p.CheckpointID, p.InterruptID, p.Flow}.complete()
+}
+
+// Binding 返回这条提案的暂停点关联。
+func (p *Proposal) Binding() InterruptBinding {
+	return InterruptBinding{p.CheckpointID, p.InterruptID, p.Flow}
+}
+
 // Approve 批准提案。批准持久化后仍未取得真实工具执行权。
 func (s *Store) Approve(id, decider string) (*Proposal, error) {
 	decider = strings.TrimSpace(decider)
@@ -253,12 +270,38 @@ func (s *Store) finish(id string, status Status, result string, execErr error) (
 	})
 }
 
-// BindInterrupt atomically associates a pending proposal with a workflow checkpoint.
-func (s *Store) BindInterrupt(id, checkpointID, interruptID string) (*Proposal, error) {
-	checkpointID = strings.TrimSpace(checkpointID)
-	interruptID = strings.TrimSpace(interruptID)
-	if checkpointID == "" || interruptID == "" {
-		return nil, errors.New("checkpoint_id 和 interrupt_id 不能为空")
+// InterruptBinding 是一条提案与它所处 Eino 暂停点的关联。
+//
+// 三个字段一起构成「重启后从哪儿接着跑」的完整线索：Flow 指明用哪个诊断分支
+// 重建 Runner，CheckpointID 指明加载哪份执行上下文，InterruptID 指明恢复其中
+// 的哪个暂停点。缺一个都恢复不了，所以它们一起校验、一起落盘。
+type InterruptBinding struct {
+	CheckpointID string
+	InterruptID  string
+	Flow         string
+}
+
+func (b InterruptBinding) trimmed() InterruptBinding {
+	return InterruptBinding{
+		CheckpointID: strings.TrimSpace(b.CheckpointID),
+		InterruptID:  strings.TrimSpace(b.InterruptID),
+		Flow:         strings.TrimSpace(b.Flow),
+	}
+}
+
+func (b InterruptBinding) complete() bool {
+	return b.CheckpointID != "" && b.InterruptID != "" && b.Flow != ""
+}
+
+// BindInterrupt 原子地把一条待审提案关联到它所处的 Eino 暂停点。
+//
+// 只有 pending 可以绑定，且一条提案只能绑一次：重复绑定同一组关联视为幂等成功
+// （恢复流程可能重放），绑到另一组则直接拒绝——那意味着有两轮执行都以为自己
+// 拥有这条提案，放行等于给同一个变更留了两条下发路径。
+func (s *Store) BindInterrupt(id string, binding InterruptBinding) (*Proposal, error) {
+	binding = binding.trimmed()
+	if !binding.complete() {
+		return nil, errors.New("checkpoint_id、interrupt_id 和 flow 不能为空")
 	}
 	s.mu.Lock()
 	p, ok := s.byID[id]
@@ -267,22 +310,26 @@ func (s *Store) BindInterrupt(id, checkpointID, interruptID string) (*Proposal, 
 		return nil, fmt.Errorf("提案 %s 不存在", id)
 	}
 	if p.Status != StatusPending {
+		current := p.Status
 		s.mu.Unlock()
-		return nil, fmt.Errorf("提案 %s 当前状态为 %s，无法绑定中断", id, p.Status)
+		return nil, fmt.Errorf("提案 %s 当前状态为 %s，无法绑定中断", id, current)
 	}
 	if p.CheckpointID != "" || p.InterruptID != "" {
-		if p.CheckpointID == checkpointID && p.InterruptID == interruptID {
+		if p.CheckpointID == binding.CheckpointID && p.InterruptID == binding.InterruptID &&
+			p.Flow == binding.Flow {
 			snapshot := p.clone()
 			s.mu.Unlock()
 			return snapshot, nil
 		}
+		bound := InterruptBinding{p.CheckpointID, p.InterruptID, p.Flow}
 		s.mu.Unlock()
-		return nil, fmt.Errorf("提案 %s 已绑定 checkpoint=%s interrupt=%s",
-			id, p.CheckpointID, p.InterruptID)
+		return nil, fmt.Errorf("提案 %s 已绑定 checkpoint=%s interrupt=%s flow=%s",
+			id, bound.CheckpointID, bound.InterruptID, bound.Flow)
 	}
 	before := p.clone()
-	p.CheckpointID = checkpointID
-	p.InterruptID = interruptID
+	p.CheckpointID = binding.CheckpointID
+	p.InterruptID = binding.InterruptID
+	p.Flow = binding.Flow
 	if err := s.saveLocked(); err != nil {
 		committed := stateWasCommitted(err)
 		if !committed {
@@ -302,6 +349,56 @@ func (s *Store) BindInterrupt(id, checkpointID, interruptID string) (*Proposal, 
 	return snapshot, nil
 }
 
+// ClearInterrupts 抹掉指向某份快照的全部暂停点关联。
+//
+// 快照被清理之后，关联指向的就是不存在的东西了。留着它，重启后的审批入口会把
+// 一条早已收场的提案当成「还能接着跑」，点下去只会撞上「快照不存在」。所以
+// 快照和关联要一起消失：有关联就意味着那一轮还在等人接。
+//
+// 只动关联，不动状态——提案本身的结局已经写死了，这里不该有任何影响。
+func (s *Store) ClearInterrupts(checkpointID string) error {
+	checkpointID = strings.TrimSpace(checkpointID)
+	if checkpointID == "" {
+		return nil
+	}
+	s.mu.Lock()
+	var (
+		cleared []*Proposal
+		before  []Proposal
+	)
+	for _, id := range s.order {
+		p := s.byID[id]
+		if p.CheckpointID != checkpointID {
+			continue
+		}
+		before = append(before, *p)
+		p.CheckpointID, p.InterruptID, p.Flow = "", "", ""
+		cleared = append(cleared, p)
+	}
+	if len(cleared) == 0 {
+		s.mu.Unlock()
+		return nil
+	}
+	if err := s.saveLocked(); err != nil {
+		if !stateWasCommitted(err) {
+			for i, p := range cleared {
+				*p = before[i]
+			}
+			s.mu.Unlock()
+			return fmt.Errorf("清理快照 %s 的中断关联: %w", checkpointID, err)
+		}
+	}
+	snapshots := make([]*Proposal, 0, len(cleared))
+	for _, p := range cleared {
+		snapshots = append(snapshots, p.clone())
+	}
+	s.mu.Unlock()
+	for _, p := range snapshots {
+		s.writeAudit("interrupt_released", p)
+	}
+	return nil
+}
+
 func (s *Store) transition(id string, want, next Status, event string, mutate func(*Proposal)) (*Proposal, error) {
 	s.mu.Lock()
 	p, ok := s.byID[id]
@@ -310,8 +407,11 @@ func (s *Store) transition(id string, want, next Status, event string, mutate fu
 		return nil, fmt.Errorf("提案 %s 不存在", id)
 	}
 	if p.Status != want {
+		// 状态要在解锁之前抄出来：解锁后 p 可能已经被抢先一步的调用改写，
+		// 那时再去读它既是数据竞争，报出来的状态也不是拒绝时看到的那个。
+		current := p.Status
 		s.mu.Unlock()
-		return nil, fmt.Errorf("提案 %s 当前状态为 %s，无法执行需要 %s 状态的操作", id, p.Status, want)
+		return nil, fmt.Errorf("提案 %s 当前状态为 %s，无法执行需要 %s 状态的操作", id, current, want)
 	}
 	before := p.clone()
 	mutate(p)
@@ -428,12 +528,14 @@ func validateLoadedProposal(p *Proposal) error {
 	default:
 		return fmt.Errorf("状态 %q 无效", p.Status)
 	}
-	if p.CheckpointID == "" != (p.InterruptID == "") {
-		return errors.New("checkpoint_id 和 interrupt_id 必须同时存在")
+	binding := InterruptBinding{p.CheckpointID, p.InterruptID, p.Flow}
+	if binding != binding.trimmed() {
+		return errors.New("checkpoint_id、interrupt_id 和 flow 不能包含首尾空白")
 	}
-	if p.CheckpointID != strings.TrimSpace(p.CheckpointID) ||
-		p.InterruptID != strings.TrimSpace(p.InterruptID) {
-		return errors.New("checkpoint_id 和 interrupt_id 不能包含首尾空白")
+	// 半截关联比没有关联更危险：它看起来「可以恢复」，实际恢复到一半才发现
+	// 缺条件，而此时人可能已经批过了。
+	if binding.complete() == (binding == InterruptBinding{}) {
+		return errors.New("checkpoint_id、interrupt_id 和 flow 必须同时存在")
 	}
 	if p.IdempotencyKey != proposalKey(p) {
 		return errors.New("idempotency_key 与提案原始内容不一致")
@@ -501,9 +603,21 @@ func (s *Store) saveLocked() error {
 }
 
 func saveStateFile(path string, data persistedStore) error {
+	encoded, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicWriteFile(path, append(encoded, '\n'))
+}
+
+// atomicWriteFile 以 0600 权限原子替换写入文件，目录按 0700 创建。
+//
+// rename 之后的目录同步失败返回 *committedStateError：新内容已经生效，调用方
+// 必须按「已提交」处理，不能当成普通写盘失败回滚——那会把已经收紧的状态放回去。
+func atomicWriteFile(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("创建提案状态目录: %w", err)
+		return fmt.Errorf("创建目录 %s: %w", dir, err)
 	}
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
@@ -515,9 +629,7 @@ func saveStateFile(path string, data persistedStore) error {
 		tmp.Close()
 		return err
 	}
-	encoder := json.NewEncoder(tmp)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(data); err != nil {
+	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
 		return err
 	}
